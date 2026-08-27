@@ -194,23 +194,28 @@ class ServerSupervisor:
         # probe finds a live TLS endpoint, stopped when the generation ends.
         # ``start()`` never raises and falls back to plain HTTP on failure.
         tls_front = CaddyTlsProxy(settings)
+        readiness: threading.Thread | None = None
         try:
             front_started = tls_front.start()
             # Publish the desktop-scoped gateway URL this generation serves.
-            # Resolution needs FCC's /health marker THROUGH the front, which
-            # only answers once Uvicorn accepts the proxied request — so
-            # before ``server.run()`` an adopted or freshly started front
-            # cannot verify yet and resolution would fall back to plain HTTP.
-            # Publish the plain-HTTP fallback first (correct whenever no
-            # front is coming), then upgrade to the TLS-prefixed URL once
-            # the server serves and the front verifies. Desktop integrations
-            # read the live value instead of guessing.
+            # The plain-HTTP fallback is correct until the front verifies,
+            # and verification needs FCC's /health marker THROUGH the front,
+            # which only answers while Uvicorn serves — so a concurrent
+            # readiness task probes during ``server.run()`` and swaps in the
+            # TLS-prefixed URL the moment the front verifies, keeping the
+            # HTTPS URL published for the whole live serving window.
             self._publish_desktop_gateway_url(settings)
+            if front_started:
+                readiness = self._start_gateway_https_readiness(settings)
             if open_admin_browser:
                 schedule_open_admin_browser(settings)
             server.run()
-            self._upgrade_desktop_gateway_to_https(settings, front_started)
         finally:
+            # Join the readiness task before tearing down the front so the
+            # published HTTPS URL stays live until the generation actually
+            # stops and no probe outlives the generation's front.
+            if readiness is not None:
+                readiness.join(timeout=GATEWAY_HEALTH_UPGRADE_SECONDS + 2.0)
             tls_front.stop()
 
         with self._lock:
@@ -228,36 +233,50 @@ class ServerSupervisor:
             self._desktop_gateway_url = gateway_url
         logger.info("Claude Desktop gateway: {}", gateway_url)
 
-    def _upgrade_desktop_gateway_to_https(
-        self,
-        settings: Settings,
-        front_started: bool,
-    ) -> None:
-        """Swap the published gateway URL to HTTPS once the front verifies.
+    def _start_gateway_https_readiness(self, settings: Settings) -> threading.Thread:
+        """Spawn the readiness task that upgrades the published URL to HTTPS.
 
-        Runs after ``server.run()`` returns: Uvicorn has served and shut
-        down, so the front can now pass FCC's ``/health`` marker probe.
-        Skipped when no front is up (disabled, failed to start, or an
-        adopted front stopped verifying) — the plain-HTTP fallback already
-        published then stays, matching the only conditions where HTTP is
-        legitimate.
+        The front can only pass FCC's ``/health`` marker probe while Uvicorn
+        serves, so the probe runs concurrently with ``server.run()`` and the
+        TLS-prefixed URL is published during the live serving window — not
+        after it ends. The task is joined before the generation's front is
+        stopped, so the HTTPS URL stays published until the generation
+        actually stops.
         """
 
-        if not front_started:
-            return
+        readiness = threading.Thread(
+            target=self._await_gateway_https_readiness,
+            args=(settings,),
+            name="fcc-gateway-https-readiness",
+            daemon=True,
+        )
+        readiness.start()
+        return readiness
+
+    def _await_gateway_https_readiness(self, settings: Settings) -> None:
+        """Publish the TLS-prefixed gateway URL once the front verifies."""
+
         root = tls_root_url(settings)
         deadline = time.monotonic() + GATEWAY_HEALTH_UPGRADE_SECONDS
         while time.monotonic() < deadline:
             if probe_fcc_front(root):
-                # The front verified, so publish the TLS-prefixed URL
-                # directly — re-resolving would probe the front a second
-                # time for the same answer.
-                gateway_url = desktop_gateway_base_url(settings, base_url=root)
-                with self._lock:
-                    self._desktop_gateway_url = gateway_url
-                logger.info("Claude Desktop gateway: {}", gateway_url)
+                self._publish_verified_https_gateway_url(settings, root)
                 return
             time.sleep(0.25)
+
+    def _publish_verified_https_gateway_url(
+        self, settings: Settings, root: str
+    ) -> None:
+        """Publish the TLS-prefixed URL for a front that just verified.
+
+        Publishes the verified root directly — re-resolving would probe the
+        front a second time for the same answer.
+        """
+
+        gateway_url = desktop_gateway_base_url(settings, base_url=root)
+        with self._lock:
+            self._desktop_gateway_url = gateway_url
+        logger.info("Claude Desktop gateway: {}", gateway_url)
 
     def _request_runtime_restart(self) -> None:
         self.request_restart()

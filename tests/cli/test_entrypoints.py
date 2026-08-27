@@ -3,6 +3,8 @@
 import json
 import subprocess
 import sys
+import threading
+import time
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
@@ -467,6 +469,15 @@ def test_serve_supervisor_orders_tls_front_around_each_generation() -> None:
                 restart_callbacks[-1]()
                 assert self.should_exit is True
                 self.config.app.runtime.is_closed = True
+            # The readiness task probes concurrently with this call; wait
+            # for this generation's upgrade so the ordering stays
+            # deterministic and the upgrade lands inside the serving window.
+            deadline = time.monotonic() + 2.0
+            while (
+                events.count("upgrade") < len(restart_callbacks)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
 
     def fake_config(app, **kwargs):
         return SimpleNamespace(app=app, kwargs=kwargs)
@@ -489,50 +500,60 @@ def test_serve_supervisor_orders_tls_front_around_each_generation() -> None:
     ):
         commands.serve()
 
-    assert events == [
-        "construct",
-        "start",
-        "server-run",
-        "upgrade",
-        "stop",
-        "construct",
-        "start",
-        "server-run",
-        "upgrade",
-        "stop",
-    ]
+    # The readiness task probes concurrently with ``server.run()``, so the
+    # upgrade event can land anywhere inside a generation's serving window.
+    # Assert the structural ordering that must hold instead of a fixed
+    # sequence: each generation constructs then starts its front before the
+    # server runs and stops the front after, and the upgrade lands between
+    # the front's start and stop.
+    constructs = [i for i, event in enumerate(events) if event == "construct"]
+    starts = [i for i, event in enumerate(events) if event == "start"]
+    runs = [i for i, event in enumerate(events) if event == "server-run"]
+    upgrades = [i for i, event in enumerate(events) if event == "upgrade"]
+    stops = [i for i, event in enumerate(events) if event == "stop"]
+    assert len(constructs) == 2
+    assert len(starts) == 2
+    assert len(runs) == 2
+    assert len(upgrades) == 2
+    assert len(stops) == 2
+    for construct, start, run, stop in zip(
+        constructs, starts, runs, stops, strict=True
+    ):
+        assert construct < start < run < stop
+    for start, upgrade, stop in zip(starts, upgrades, stops, strict=True):
+        assert start < upgrade < stop
 
 
 @pytest.mark.parametrize(
-    ("front_started", "probe_after_start", "expected_final"),
+    ("front_started", "probe_verifies", "expected_final"),
     [
         # Front up and verifying once Uvicorn serves: the generation starts
-        # on the plain-HTTP fallback and upgrades to the TLS-prefixed URL.
+        # on the plain-HTTP fallback and upgrades to the TLS-prefixed URL
+        # while the server is still serving.
         (True, True, "https://localhost:18443/claude-desktop"),
         # Front started but its health probe never verifies: the plain-HTTP
         # fallback stays for the whole generation.
         (True, False, "http://127.0.0.1:8082/claude-desktop"),
         # No front at all (disabled or failed to start): plain HTTP, and no
-        # post-start health probing happens.
+        # readiness probing happens.
         (False, None, "http://127.0.0.1:8082/claude-desktop"),
     ],
 )
 def test_serve_publishes_desktop_gateway_url_matching_tls_readiness(
     front_started: bool,
-    probe_after_start: bool | None,
+    probe_verifies: bool | None,
     expected_final: str,
 ) -> None:
     """The supervisor publishes the live desktop-scoped gateway URL.
 
-    End-to-end guard for the Greptile "desktop gateway URL is permanently
-    published as HTTP before Uvicorn makes the managed HTTPS proxy healthy"
-    finding: resolution needs FCC's ``/health`` marker through the front,
-    which cannot answer before Uvicorn serves, so the generation publishes
-    the plain-HTTP fallback first and upgrades to the TLS-prefixed URL only
-    after the server has run and the front's health probe succeeds. The
-    fallback is preserved when the front failed to start or never verifies.
-    The URL is cleared once the supervisor shuts down so a stopped server
-    never advertises a dead endpoint.
+    End-to-end guard for the Greptile "HTTPS gateway is published after
+    shutdown" finding: the front can only pass FCC's ``/health`` marker
+    probe while Uvicorn serves, so a concurrent readiness task probes
+    during ``server.run()`` and the TLS-prefixed URL becomes readable
+    DURING the live serving window — not after it ends. The fallback is
+    preserved when the front failed to start or never verifies. The URL is
+    cleared once the supervisor shuts down so a stopped server never
+    advertises a dead endpoint.
     """
     from free_claude_code.cli import commands
 
@@ -543,9 +564,13 @@ def test_serve_publishes_desktop_gateway_url_matching_tls_readiness(
             "desktop_gateway_prefix": "claude-desktop",
         }
     )
+    published_at_start: list[str | None] = []
     published_during_run: list[str | None] = []
     published_at_stop: list[str | None] = []
     probe_calls: list[str] = []
+    # The front can only pass FCC's /health marker while Uvicorn serves, so
+    # the fake probe only verifies once the fake server is inside ``run()``.
+    serving = threading.Event()
 
     def build_asgi_app(_settings: Settings, restart_callback: Callable[[], None]):
         return SimpleNamespace(runtime=SimpleNamespace(is_closed=False))
@@ -562,8 +587,8 @@ def test_serve_publishes_desktop_gateway_url_matching_tls_readiness(
 
         def stop(self) -> None:
             # ``stop()`` runs in the generation's ``finally`` after the
-            # post-start upgrade and before the supervisor clears the URL,
-            # so it observes the final published value.
+            # readiness task is joined and before the supervisor clears the
+            # URL, so it observes the final published value.
             published_at_stop.append(supervisor.desktop_gateway_url())
 
     supervisor = commands.ServerSupervisor(console_logging=False)
@@ -574,14 +599,24 @@ def test_serve_publishes_desktop_gateway_url_matching_tls_readiness(
             self.should_exit = False
 
         def run(self):
-            # Capture the URL the generation published while it is live.
-            published_during_run.append(supervisor.desktop_gateway_url())
+            # The readiness task probes concurrently with this call. Record
+            # the URL before the front can verify (still the HTTP fallback),
+            # then open the serving window and require the final URL to
+            # become readable before ``run()`` returns.
+            published_at_start.append(supervisor.desktop_gateway_url())
+            serving.set()
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                published_during_run.append(supervisor.desktop_gateway_url())
+                if published_during_run[-1] == expected_final:
+                    break
+                time.sleep(0.01)
             self.config.app.runtime.is_closed = True
 
     def fake_probe(*_args: object) -> bool:
         probe_calls.append("probe")
-        assert probe_after_start is not None
-        return probe_after_start
+        assert probe_verifies is not None
+        return probe_verifies and serving.is_set()
 
     with (
         patch.object(commands, "load_server_settings", return_value=settings),
@@ -598,14 +633,16 @@ def test_serve_publishes_desktop_gateway_url_matching_tls_readiness(
         supervisor.run(open_admin_browser=False)
 
     # Before Uvicorn serves, the front cannot verify FCC's health marker,
-    # so the live publication is always the plain-HTTP fallback.
-    assert published_during_run == ["http://127.0.0.1:8082/claude-desktop"]
-    # After the server has run, the generation's final URL matches the
-    # front's verified state.
+    # so the initial publication is always the plain-HTTP fallback.
+    assert published_at_start == ["http://127.0.0.1:8082/claude-desktop"]
+    # The final URL is readable DURING the live serving window, before
+    # ``server.run()`` returns.
+    assert published_during_run[-1] == expected_final
+    # ...and it stays published until the generation actually stops.
     assert published_at_stop == [expected_final]
     if front_started:
-        # The post-start health probe runs at least once; a never-healthy
-        # front retries until the upgrade deadline, so only assert presence.
+        # The readiness task probes at least once; a never-healthy front
+        # retries until the deadline, so only assert presence.
         assert probe_calls
     else:
         assert probe_calls == []
