@@ -22,6 +22,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -126,14 +127,21 @@ def _save_config(path: Path, data: dict[str, object]) -> None:
 
     The block embeds the gateway auth token, so the file is written with
     owner-only permissions and the config directories stay owner-traversable
-    regardless of the process umask.
+    regardless of the process umask. The temporary file is newly allocated
+    with ``O_EXCL`` (never following or reusing a pre-existing path), so an
+    attacker-placed permissive file or symlink at a predictable name can
+    neither read the token nor redirect the write to another file; its mode
+    is forced to owner-only before the atomic replace.
     """
 
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     _restrict_permissions(path.parent)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    descriptor = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    descriptor, tmp_name = tempfile.mkstemp(
+        prefix=f"{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    tmp_path = Path(tmp_name)
     try:
+        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(data, indent=2))
     except BaseException:

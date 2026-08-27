@@ -520,3 +520,46 @@ def test_save_config_permissions_survive_permissive_umask(
     # nor the directory holding it may be group/world readable.
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
     assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+
+
+def test_save_config_ignores_preexisting_permissive_tmp(
+    tmp_path: Path,
+) -> None:
+    # Regression guard for the Greptile "temporary path exposure" finding:
+    # a pre-existing permissive file at the old predictable ``.tmp`` name
+    # must not receive the token. The writer allocates a fresh exclusive
+    # temp file, so the attacker-placed file is left untouched and the
+    # final config is owner-only.
+    target = tmp_path / "claude_desktop_config.json"
+    planted = tmp_path / "claude_desktop_config.json.tmp"
+    planted.write_text("attacker", encoding="utf-8")
+    os.chmod(planted, 0o644)
+
+    routing._save_config(target, {"inference": {"inferenceAnthropicApiKey": "tok"}})
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    # The planted file is neither reused nor overwritten.
+    assert planted.read_text(encoding="utf-8") == "attacker"
+    assert "tok" not in planted.read_text(encoding="utf-8")
+
+
+def test_save_config_does_not_follow_tmp_symlink(
+    tmp_path: Path,
+) -> None:
+    # Regression guard for the Greptile "temporary path exposure" finding:
+    # a symlink at the old predictable ``.tmp`` name must not redirect the
+    # token write to an external file. The writer allocates a fresh
+    # exclusive temp file, so the symlink target is never written.
+    target = tmp_path / "claude_desktop_config.json"
+    external = tmp_path / "external-readable.txt"
+    external.write_text("external", encoding="utf-8")
+    os.chmod(external, 0o644)
+    planted = tmp_path / "claude_desktop_config.json.tmp"
+    planted.symlink_to(external)
+
+    routing._save_config(target, {"inference": {"inferenceAnthropicApiKey": "tok"}})
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    # The symlink target never receives the credential.
+    assert external.read_text(encoding="utf-8") == "external"
+    assert "tok" not in external.read_text(encoding="utf-8")
