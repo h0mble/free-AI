@@ -700,6 +700,57 @@ def test_unconfigure_preserves_post_configure_block_replacement(
     assert "fccPriorConfig" not in restored
 
 
+def test_unconfigure_preserves_replacement_dict_retaining_fcc_token(
+    fake_config: Path,
+    fake_settings: Settings,
+) -> None:
+    # Regression guard for the Greptile "unconfigure replaces a retained-
+    # token user routing dict with stale non-dict inference" finding: a user
+    # can legitimately keep the FCC auth token while replacing the provider,
+    # gateway URL, and adding custom routing fields. A retained token alone
+    # does not prove whole-block ownership, so unconfigure must keep the
+    # user's dict (removing only the individually FCC-owned token field)
+    # instead of restoring the stale verbatim raw value.
+    fake_config.write_text(json.dumps({"inference": "legacy-string"}), encoding="utf-8")
+
+    assert (
+        claude_desktop.configure_claude_desktop_config(
+            fake_config,
+            settings=fake_settings,
+            gateway_base_url="https://localhost:8443/claude-desktop",
+        )
+        is True
+    )
+    configured = json.loads(fake_config.read_text(encoding="utf-8"))
+    assert configured["fccPriorConfig"]["inferenceRaw"] == "legacy-string"
+
+    # The user replaces the whole routing dict but keeps the FCC token.
+    configured["inference"] = {
+        "provider": "user-routing",
+        "inferenceProvider": "user-routing",
+        "inferenceGatewayBaseUrl": "https://user.example/routing",
+        "inferenceAnthropicApiKey": "tok-123",
+        "userRoutingSetting": "retain-me",
+    }
+    fake_config.write_text(json.dumps(configured), encoding="utf-8")
+
+    assert (
+        claude_desktop.unconfigure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is True
+    )
+    restored = json.loads(fake_config.read_text(encoding="utf-8"))
+    # The user's routing survives; only the still-FCC token field is removed.
+    assert restored["inference"] == {
+        "provider": "user-routing",
+        "inferenceProvider": "user-routing",
+        "inferenceGatewayBaseUrl": "https://user.example/routing",
+        "userRoutingSetting": "retain-me",
+    }
+    assert "fccPriorConfig" not in restored
+
+
 def test_unconfigure_roundtrip_is_clean_noop(
     fake_config: Path,
     fake_settings: Settings,

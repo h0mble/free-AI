@@ -279,8 +279,10 @@ def unconfigure_claude_desktop_config(
     are restored, while values the user changed after configure are kept as
     they are (restoring the stale snapshot entry would overwrite the user's
     post-install choice). A non-object ``inference`` value recorded verbatim
-    by the snapshot is restored exactly, but only while the block is still
-    FCC's (the settings-derived auth token proves it). Without a snapshot (a
+    by the snapshot is restored exactly, but only while the inference block
+    still exactly matches what the merge wrote — a retained auth token alone
+    does not prove whole-block ownership, since a user can keep the token
+    while replacing other routing fields. Without a snapshot (a
     config written before backups existed or by hand) ownership is decided by
     the recorded auth token: it is settings-derived and stable across front
     state, so when it matches the FCC token the whole block is FCC's and
@@ -344,11 +346,16 @@ def unconfigure_claude_desktop_config(
         prior_raw = backup.get("inference")
         prior = prior_raw if isinstance(prior_raw, dict) else {}
         # The verbatim ``inferenceRaw`` restore below replaces the whole
-        # block; it is only safe while the block is still FCC's, which the
-        # settings-derived auth token proves (stable across front state).
-        block_fcc_owned = inference_dict.get("inferenceAnthropicApiKey") == written.get(
-            "inferenceAnthropicApiKey"
-        )
+        # block; it is only safe while the block is still EXACTLY what the
+        # merge wrote. A retained auth token alone does not prove that: a
+        # user can legitimately keep the FCC token while replacing the
+        # provider, gateway URL, or any other routing field, and restoring
+        # the stale raw value over such an edited dict would destroy the
+        # user's routing. Require every written field to match and no extra
+        # keys — an added or changed key means the user edited the block,
+        # so it is theirs now and only individually matching fields are
+        # still removed below.
+        block_fcc_owned = isinstance(inference_raw, dict) and inference_dict == written
 
         discovery_fcc_owned = data.get(_DISCOVERY_KEY) is True
         if discovery_fcc_owned:
