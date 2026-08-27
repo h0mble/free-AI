@@ -80,13 +80,16 @@ def require_proxy_auth(
         # not a missing one; with no Authorization at all it's just missing.
         raise HTTPException(
             status_code=401,
-            detail="Missing proxy authentication token",
+            detail=(
+                "Invalid proxy authentication token"
+                if request.headers.get("authorization")
+                else "Missing proxy authentication token"
+            ),
         )
 
-    if not _proxy_token_matches(
-        authorization,
-        settings.proxy_auth_token,
-        require_bearer=True,
+    if not secrets.compare_digest(
+        token.encode("utf-8"),
+        settings.proxy_auth_token.encode("utf-8"),
     ):
         raise HTTPException(
             status_code=401,
