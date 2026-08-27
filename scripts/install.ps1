@@ -1262,7 +1262,7 @@ function Configure-ClaudeDesktopApp {
 
     & $pythonExe -m free_claude_code.cli.launchers.claude_desktop --configure
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "Failed to auto-configure Claude Desktop (exit code $LASTEXITCODE). Run `fcc-claude-desktop --configure` manually."
+        Write-Warning "Failed to auto-configure Claude Desktop (exit code $LASTEXITCODE). Configure it after starting FCC with a verified HTTPS front: run ``fcc-claude-desktop`` (which brings up the front), or start ``fcc-desktop`` and then run ``fcc-claude-desktop --configure``."
     }
 }
 

@@ -1153,7 +1153,7 @@ configure_claude_desktop_app() {
         free_claude_code.cli.launchers.claude_desktop --configure \
         || configure_status=$?
     if [ "$configure_status" -ne 0 ]; then
-        printf 'warning: Failed to auto-configure Claude Desktop (exit code %d). Run `fcc-claude-desktop --configure` manually.\n' "$configure_status" >&2
+        printf 'warning: Failed to auto-configure Claude Desktop (exit code %d). Configure it after starting FCC with a verified HTTPS front: run `fcc-claude-desktop` (which brings up the front), or start `fcc-desktop` and then run `fcc-claude-desktop --configure`.\n' "$configure_status" >&2
     fi
 
     install_claude_desktop_cert
