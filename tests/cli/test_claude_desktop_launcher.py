@@ -358,6 +358,27 @@ def test_launch_configure_never_spawns_its_own_front(
     assert data["inference"]["inferenceGatewayBaseUrl"].startswith("https://")
 
 
+def test_launch_configure_refuses_malformed_config(
+    tmp_path: Path,
+    verified_front: FakeFront,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Regression guard for the Greptile "malformed configure reports
+    # success" finding: a malformed config makes configure skip without
+    # writing, which must exit nonzero — never "Already merged".
+    fake = tmp_path / "claude_desktop_config.json"
+    fake.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        claude_desktop.launch(["--configure", "--config-path", str(fake)])
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "malformed config" in captured.err
+    assert "Already merged" not in captured.out
+    assert fake.read_text(encoding="utf-8") == "{not json"
+
+
 def test_launch_configure_refuses_without_https_front(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

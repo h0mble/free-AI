@@ -473,6 +473,37 @@ def test_main_configure_adopts_existing_front_without_spawning_one(
     assert data["inference"]["inferenceGatewayBaseUrl"].startswith("https://")
 
 
+def test_main_configure_refuses_malformed_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_settings: Settings,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Regression guard for the Greptile "malformed configure reports
+    # success" finding: configure returns False for BOTH an idempotent
+    # no-op and a malformed-config skip, so the skip must be refused
+    # with a nonzero exit instead of reported as "Already merged".
+    fake = tmp_path / "claude_desktop_config.json"
+    fake.write_text("{not json", encoding="utf-8")
+
+    monkeypatch.setattr(
+        claude_desktop, "get_settings", lambda: fake_settings, raising=False
+    )
+    monkeypatch.setattr(
+        claude_desktop, "verified_https_gateway_url", lambda settings: "https://x"
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        claude_desktop.main(["--configure", "--config-path", str(fake)])
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "malformed config" in captured.err
+    assert "Already merged" not in captured.out
+    # The malformed file is left untouched.
+    assert fake.read_text(encoding="utf-8") == "{not json"
+
+
 def test_main_configure_refuses_without_https_front(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

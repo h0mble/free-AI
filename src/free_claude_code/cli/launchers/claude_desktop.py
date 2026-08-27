@@ -88,8 +88,7 @@ def launch(argv: Sequence[str] | None = None) -> None:
         changed = configure_claude_desktop_config(
             parsed.config_path, gateway_base_url=gateway_url
         )
-        target = parsed.config_path or _config_path()
-        print(f"{'Updated' if changed else 'Already merged'}: {target}")
+        routing.report_configure_result(parsed.config_path or _config_path(), changed)
         return
 
     if parsed.unconfigure:

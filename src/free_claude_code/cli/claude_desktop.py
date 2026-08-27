@@ -321,6 +321,29 @@ def unconfigure_claude_desktop_config(
     return changed
 
 
+def report_configure_result(target: Path, changed: bool) -> None:
+    """Report a configure outcome, refusing a malformed-config skip.
+
+    ``configure_claude_desktop_config`` returns ``False`` for both an
+    idempotent no-op and a malformed-config skip; only the skip leaves
+    Claude Desktop unrouted, so reading the config back distinguishes
+    them. "Already merged" is reserved for a valid config that already
+    carries the routing block; a malformed one exits nonzero.
+    """
+
+    if not changed:
+        try:
+            load_existing_config(target)
+        except MalformedConfigError as exc:
+            print(
+                f"Refusing to configure Claude Desktop: malformed config at "
+                f"{exc.path}: {exc.reason}. Fix or remove the file and retry.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from None
+    print(f"{'Updated' if changed else 'Already merged'}: {target}")
+
+
 def find_binary() -> str | None:
     """Locate the Claude Desktop binary via PATH, then platform defaults."""
 
@@ -471,7 +494,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     changed = configure_claude_desktop_config(
         args.config_path, gateway_base_url=gateway_url
     )
-    print(f"{'Updated' if changed else 'Already merged'}: {target}")
+    report_configure_result(target, changed)
 
 
 if __name__ == "__main__":
