@@ -29,7 +29,6 @@ from loguru import logger
 
 from free_claude_code.cli.tls_proxy import (
     desktop_gateway_base_url,
-    ensure_https_front,
     verified_https_gateway_url,
 )
 from free_claude_code.config.loader import get_settings
@@ -211,13 +210,15 @@ def unconfigure_claude_desktop_config(
 ) -> bool:
     """Reverse the merge. Preserves every key outside the FCC-managed surface.
 
-    Managed keys are removed regardless of their recorded values: the
-    gateway URL a previous ``configure`` wrote may no longer match current
-    resolution (most notably when the HTTPS front is gone and resolution
-    falls back to plain HTTP), and a value-gated removal would then leave
-    the persisted gateway URL and auth token behind. Returns ``False``
-    without writing when the existing config is malformed, or silently when
-    the file does not exist.
+    Ownership is decided by the recorded auth token: it is settings-derived
+    and stable across front state, so when it matches the FCC token the
+    whole block is FCC's and every managed key is removed — even a gateway
+    URL that no longer matches current resolution because the HTTPS front
+    is gone and resolution fell back to plain HTTP. Without that token
+    match only keys whose recorded values exactly match current resolution
+    are removed, so user-owned values that share FCC key names survive.
+    Returns ``False`` without writing when the existing config is
+    malformed, or silently when the file does not exist.
     """
 
     resolved_settings = settings or get_settings()
@@ -247,8 +248,11 @@ def unconfigure_claude_desktop_config(
             inference_dict: dict[str, object] = {}
             for key, value in inference.items():
                 inference_dict[str(key)] = value
-            for key in managed:
-                if key in inference_dict:
+            managed_token = managed["inferenceAnthropicApiKey"]
+            fcc_owned = inference_dict.get("inferenceAnthropicApiKey") == managed_token
+            for key, value in managed.items():
+                recorded = inference_dict.get(key)
+                if recorded is not None and (fcc_owned or recorded == value):
                     del inference_dict[key]
                     changed = True
             if inference_dict:
@@ -396,13 +400,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(f"{'Removed FCC block' if changed else 'Nothing to remove'}: {target}")
         return
 
-    # --configure persists the gateway credential, so it gets the same
-    # verified-HTTPS gate as the launch path: without a verified front the
-    # URL would fall back to plain HTTP and persist the reusable proxy
-    # token against a cleartext endpoint. Refuse without writing instead.
-    settings = get_settings()
-    tls_front = ensure_https_front(settings)
-    if tls_front is None:
+    # --configure persists the gateway credential, so it only writes
+    # against a verified HTTPS front: without one the URL would fall back
+    # to plain HTTP and persist the reusable proxy token against a
+    # cleartext endpoint. Adoption is probe-only — this command exits
+    # right after writing, so a front it spawned itself would die with it
+    # and leave the config it just wrote pointing at a dead gateway.
+    gateway_url = verified_https_gateway_url(get_settings())
+    if gateway_url is None:
         print(
             "Refusing to configure Claude Desktop: no verified FCC HTTPS "
             "front is available. Enable the caddy TLS proxy (or start the "
@@ -410,22 +415,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             file=sys.stderr,
         )
         raise SystemExit(1)
-    try:
-        gateway_url = verified_https_gateway_url(settings)
-        if gateway_url is None:
-            print(
-                "Refusing to configure Claude Desktop: the FCC HTTPS front "
-                "stopped verifying before the routing block could be "
-                "written. Retry once the front is healthy.",
-                file=sys.stderr,
-            )
-            raise SystemExit(1)
-        changed = configure_claude_desktop_config(
-            args.config_path, settings=settings, gateway_base_url=gateway_url
-        )
-        print(f"{'Updated' if changed else 'Already merged'}: {target}")
-    finally:
-        tls_front.stop()
+    changed = configure_claude_desktop_config(
+        args.config_path, gateway_base_url=gateway_url
+    )
+    print(f"{'Updated' if changed else 'Already merged'}: {target}")
 
 
 if __name__ == "__main__":

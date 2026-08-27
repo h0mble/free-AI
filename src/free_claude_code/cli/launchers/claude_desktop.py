@@ -68,14 +68,16 @@ def launch(argv: Sequence[str] | None = None) -> None:
     parsed = _build_argparser().parse_args(args)
 
     if parsed.configure:
-        # --configure persists the gateway credential, so it gets the same
-        # verified-HTTPS gate as the launch path: without a verified front
-        # the URL would fall back to plain HTTP and persist the reusable
-        # proxy token against a cleartext endpoint any local process could
-        # occupy. Refuse without changing the config instead.
-        settings = get_settings()
-        tls_front = ensure_https_front(settings)
-        if tls_front is None:
+        # --configure persists the gateway credential, so it only writes
+        # against a verified HTTPS front: without one the URL would fall
+        # back to plain HTTP and persist the reusable proxy token against
+        # a cleartext endpoint any local process could occupy. Adoption is
+        # probe-only — this command exits right after writing, so a front
+        # it spawned itself would die with it and leave the config it just
+        # wrote pointing at a dead gateway. The front must already be up
+        # (FCC desktop host or the managed caddy proxy) and stay up.
+        gateway_url = verified_https_gateway_url(get_settings())
+        if gateway_url is None:
             print(
                 "Refusing to configure Claude Desktop: no verified FCC "
                 "HTTPS front is available. Enable the caddy TLS proxy (or "
@@ -83,23 +85,11 @@ def launch(argv: Sequence[str] | None = None) -> None:
                 file=sys.stderr,
             )
             raise SystemExit(1)
-        try:
-            gateway_url = verified_https_gateway_url(settings)
-            if gateway_url is None:
-                print(
-                    "Refusing to configure Claude Desktop: the FCC HTTPS "
-                    "front stopped verifying before the routing block could "
-                    "be written. Retry once the front is healthy.",
-                    file=sys.stderr,
-                )
-                raise SystemExit(1)
-            changed = configure_claude_desktop_config(
-                parsed.config_path, gateway_base_url=gateway_url
-            )
-            target = parsed.config_path or _config_path()
-            print(f"{'Updated' if changed else 'Already merged'}: {target}")
-        finally:
-            tls_front.stop()
+        changed = configure_claude_desktop_config(
+            parsed.config_path, gateway_base_url=gateway_url
+        )
+        target = parsed.config_path or _config_path()
+        print(f"{'Updated' if changed else 'Already merged'}: {target}")
         return
 
     if parsed.unconfigure:

@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from free_claude_code.cli import claude_desktop as routing
+from free_claude_code.cli import tls_proxy
 from free_claude_code.cli.launchers import claude_desktop
 from free_claude_code.config.settings import Settings
 
@@ -322,10 +323,39 @@ def test_launch_configure_does_not_invoke_subprocess(
 
     data = json.loads(fake.read_text(encoding="utf-8"))
     assert data["modelDiscoveryEnabled"] is True
-    # The persisted block must point at the verified HTTPS front, and the
-    # front brought up for the write is stopped on the way out.
+    # The persisted block must point at the verified HTTPS front.
     assert data["inference"]["inferenceGatewayBaseUrl"] == _DETERMINISTIC_URL
-    assert verified_front.stop_count == 1
+    # --configure adopts the already-running front and never manages one,
+    # so the config it writes cannot outlive a front the command spawned.
+    assert verified_front.stop_count == 0
+
+
+def test_launch_configure_never_spawns_its_own_front(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Regression guard for the Greptile "configure kills its own gateway"
+    # finding: the command exits right after writing, so a front it
+    # spawned would die with it and leave the config pointing at a dead
+    # gateway. Adoption is probe-only: verification runs for real here
+    # (probe pinned), and any attempt to bring up a managed proxy trips
+    # the construction guard.
+    fake = tmp_path / "claude_desktop_config.json"
+
+    def fail_spawn(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("configure must never bring up its own front")
+
+    monkeypatch.setattr(tls_proxy, "CaddyTlsProxy", fail_spawn)
+    monkeypatch.setattr(tls_proxy, "probe_fcc_front", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        tls_proxy, "load_or_create_front_identity", lambda *a, **kw: "pinned"
+    )
+
+    claude_desktop.launch(["--configure", "--config-path", str(fake)])
+
+    data = json.loads(fake.read_text(encoding="utf-8"))
+    assert data["inference"]["inferenceGatewayBaseUrl"].startswith("https://")
 
 
 def test_launch_configure_refuses_without_https_front(
@@ -339,29 +369,6 @@ def test_launch_configure_refuses_without_https_front(
     # credential to whatever occupies that endpoint. Refuse, untouched.
     fake = tmp_path / "claude_desktop_config.json"
 
-    monkeypatch.setattr(claude_desktop, "ensure_https_front", lambda settings: None)
-
-    with pytest.raises(SystemExit) as exc:
-        claude_desktop.launch(["--configure", "--config-path", str(fake)])
-
-    assert exc.value.code == 1
-    assert not fake.exists()
-    captured = capsys.readouterr()
-    assert "no verified FCC HTTPS front" in captured.err
-
-
-def test_launch_configure_refuses_when_front_stops_verifying(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    # The front can stop verifying between bring-up and the config write;
-    # --configure must re-check and refuse rather than persist the HTTP
-    # fallback, and must still stop the front it brought up.
-    fake = tmp_path / "claude_desktop_config.json"
-    front = FakeFront()
-
-    monkeypatch.setattr(claude_desktop, "ensure_https_front", lambda settings: front)
     monkeypatch.setattr(
         claude_desktop, "verified_https_gateway_url", lambda settings: None
     )
@@ -371,9 +378,8 @@ def test_launch_configure_refuses_when_front_stops_verifying(
 
     assert exc.value.code == 1
     assert not fake.exists()
-    assert front.stop_count == 1
     captured = capsys.readouterr()
-    assert "stopped verifying" in captured.err
+    assert "no verified FCC HTTPS front" in captured.err
 
 
 def test_launch_refuses_malformed_config(

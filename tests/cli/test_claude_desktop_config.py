@@ -215,8 +215,10 @@ def test_unconfigure_removes_block_when_gateway_url_no_longer_matches(
     # Regression guard for the Greptile "unconfigure leaves the gateway
     # behind" finding: a previous configure persisted the HTTPS gateway
     # URL, but the front is now gone and URL resolution falls back to
-    # plain HTTP. Removal must not depend on the recorded values matching
+    # plain HTTP. Removal must not depend on the recorded URL matching
     # current resolution, or the gateway URL and auth token stay behind.
+    # The settings-derived token is stable across front state, so it is
+    # the ownership marker that still identifies the block as FCC's.
     fake_config.write_text(
         json.dumps(
             {
@@ -246,6 +248,42 @@ def test_unconfigure_removes_block_when_gateway_url_no_longer_matches(
     assert "modelDiscoveryEnabled" not in data
     assert data["inference"] == {"extra_user_key": "stay"}
     assert data["preferences"] == {"theme": "dark"}
+
+
+def test_unconfigure_preserves_user_values_sharing_fcc_key_names(
+    fake_config: Path,
+    fake_settings: Settings,
+) -> None:
+    # Regression guard for the Greptile "unconfigure erases user settings"
+    # finding: keys that share FCC-managed names but hold values FCC never
+    # wrote (neither the current resolution nor the FCC auth token) belong
+    # to the user and must survive removal.
+    fake_config.write_text(
+        json.dumps(
+            {
+                "modelDiscoveryEnabled": True,
+                "inference": {
+                    "provider": "anthropic",
+                    "inferenceGatewayBaseUrl": "https://api.user-gateway.example",
+                    "inferenceAnthropicApiKey": "user-secret-key",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    changed = claude_desktop.unconfigure_claude_desktop_config(
+        fake_config, settings=fake_settings
+    )
+
+    assert changed is True
+    data = json.loads(fake_config.read_text(encoding="utf-8"))
+    assert "modelDiscoveryEnabled" not in data
+    assert data["inference"] == {
+        "provider": "anthropic",
+        "inferenceGatewayBaseUrl": "https://api.user-gateway.example",
+        "inferenceAnthropicApiKey": "user-secret-key",
+    }
 
 
 def test_unconfigure_roundtrip_is_clean_noop(
@@ -295,23 +333,12 @@ def test_config_path_resolver_returns_default_paths(
         assert path.is_absolute()
 
 
-class _FakeFront:
-    """Stand-in for the managed TLS proxy ``main`` brings up."""
-
-    def __init__(self) -> None:
-        self.stop_count = 0
-
-    def stop(self) -> None:
-        self.stop_count += 1
-
-
 def test_main_configure_writes_block_without_subprocess(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     fake_settings: Settings,
 ) -> None:
     fake = tmp_path / "claude_desktop_config.json"
-    front = _FakeFront()
     verified_url = "https://localhost:8443/claude-desktop"
 
     def fail_popen(*_args: object, **_kwargs: object) -> None:
@@ -321,7 +348,6 @@ def test_main_configure_writes_block_without_subprocess(
     monkeypatch.setattr(
         claude_desktop, "get_settings", lambda: fake_settings, raising=False
     )
-    monkeypatch.setattr(claude_desktop, "ensure_https_front", lambda settings: front)
     monkeypatch.setattr(
         claude_desktop, "verified_https_gateway_url", lambda settings: verified_url
     )
@@ -330,10 +356,35 @@ def test_main_configure_writes_block_without_subprocess(
 
     data = json.loads(fake.read_text(encoding="utf-8"))
     assert data["modelDiscoveryEnabled"] is True
-    # The persisted block must point at the verified HTTPS front, and the
-    # front brought up for the write is stopped on the way out.
+    # The persisted block must point at the verified HTTPS front.
     assert data["inference"]["inferenceGatewayBaseUrl"] == verified_url
-    assert front.stop_count == 1
+
+
+def test_main_configure_adopts_existing_front_without_spawning_one(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_settings: Settings,
+) -> None:
+    # The command exits right after writing, so a front it spawned itself
+    # would die with it and leave the config pointing at a dead gateway.
+    # Adoption must be probe-only: verification runs for real here (probe
+    # pinned), and any attempt to bring up a managed proxy trips the
+    # construction guard.
+    fake = tmp_path / "claude_desktop_config.json"
+
+    def fail_spawn(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("configure must never bring up its own front")
+
+    monkeypatch.setattr(
+        claude_desktop, "get_settings", lambda: fake_settings, raising=False
+    )
+    monkeypatch.setattr(tls_proxy, "CaddyTlsProxy", fail_spawn)
+    monkeypatch.setattr(tls_proxy, "probe_fcc_front", lambda *a, **kw: True)
+
+    claude_desktop.main(["--configure", "--config-path", str(fake)])
+
+    data = json.loads(fake.read_text(encoding="utf-8"))
+    assert data["inference"]["inferenceGatewayBaseUrl"].startswith("https://")
 
 
 def test_main_configure_refuses_without_https_front(
@@ -350,7 +401,9 @@ def test_main_configure_refuses_without_https_front(
     monkeypatch.setattr(
         claude_desktop, "get_settings", lambda: fake_settings, raising=False
     )
-    monkeypatch.setattr(claude_desktop, "ensure_https_front", lambda settings: None)
+    monkeypatch.setattr(
+        claude_desktop, "verified_https_gateway_url", lambda settings: None
+    )
 
     with pytest.raises(SystemExit) as exc:
         claude_desktop.main(["--configure", "--config-path", str(fake)])
