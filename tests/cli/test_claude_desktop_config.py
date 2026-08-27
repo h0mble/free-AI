@@ -370,9 +370,11 @@ def test_configure_keeps_first_snapshot_across_remerges(
     fake_config: Path,
     fake_settings: Settings,
 ) -> None:
-    # The snapshot must record the user's ORIGINAL values: a re-merge that
-    # refreshed it with FCC's own block would make unconfigure "restore"
-    # the FCC values instead of the user's.
+    # The snapshot's user-state entries must record the user's ORIGINAL
+    # values: a re-merge that refreshed them with FCC's own block would make
+    # unconfigure "restore" the FCC values instead of the user's. (The
+    # ``managed`` entry is different: it tracks the newest block FCC writes
+    # and is refreshed on every merge; see the rotation test below.)
     fake_config.write_text(
         json.dumps(
             {
@@ -409,6 +411,71 @@ def test_configure_keeps_first_snapshot_across_remerges(
             "provider": "anthropic",
             "inferenceAnthropicApiKey": "user-secret-key",
         },
+    }
+
+
+def test_reconfigure_with_rotated_token_updates_ownership_record(
+    fake_config: Path,
+    fake_settings: Settings,
+) -> None:
+    # Regression guard for the Greptile "stale ownership snapshot" finding:
+    # a second configure with a rotated proxy token or gateway URL must
+    # refresh the snapshot's record of the block FCC writes while keeping
+    # the original user-value backup frozen. Unconfigure then removes the
+    # newest FCC credential and URL instead of stranding them as if they
+    # were user-owned.
+    fake_config.write_text(
+        json.dumps(
+            {
+                "inference": {
+                    "provider": "anthropic",
+                    "inferenceAnthropicApiKey": "user-before",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        claude_desktop.configure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is True
+    )
+
+    rotated = Settings(
+        host=fake_settings.host,
+        port=fake_settings.port,
+        proxy_auth_token="rotated-token",
+    )
+    rotated_url = "https://localhost:9443/claude-desktop"
+    assert (
+        claude_desktop.configure_claude_desktop_config(
+            fake_config, settings=rotated, gateway_base_url=rotated_url
+        )
+        is True
+    )
+    reconfigured = json.loads(fake_config.read_text(encoding="utf-8"))
+    # The ownership record tracks the newest written block; the user-value
+    # backup stays frozen at the original pre-install values.
+    assert reconfigured["fccPriorConfig"][
+        "managed"
+    ] == claude_desktop.fcc_managed_block(rotated, rotated_url)
+    assert reconfigured["fccPriorConfig"]["inference"] == {
+        "provider": "anthropic",
+        "inferenceAnthropicApiKey": "user-before",
+    }
+
+    assert (
+        claude_desktop.unconfigure_claude_desktop_config(fake_config, settings=rotated)
+        is True
+    )
+    restored = json.loads(fake_config.read_text(encoding="utf-8"))
+    assert restored == {
+        "inference": {
+            "provider": "anthropic",
+            "inferenceAnthropicApiKey": "user-before",
+        }
     }
 
 

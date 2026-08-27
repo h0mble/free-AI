@@ -175,7 +175,9 @@ def configure_claude_desktop_config(
     snapshotted under ``fccPriorConfig``; ``unconfigure`` restores that
     snapshot so temporarily enabling FCC never destroys the user's previous
     provider, gateway, credential, or discovery settings. Re-merges keep the
-    original snapshot untouched.
+    original user-state entries untouched, but refresh the snapshot's record
+    of the exact block FCC writes so ownership stays correct when the proxy
+    token or gateway URL rotated between configures.
 
     Returns ``False`` without writing when the existing config is malformed
     (invalid JSON or non-object root). Creates a new config when absent.
@@ -215,13 +217,21 @@ def configure_claude_desktop_config(
         for key, value in inference_raw.items():
             inference_dict[str(key)] = value
 
-    if _BACKUP_KEY not in data:
-        backup: dict[str, object] = {}
-        # Record the exact block this merge writes. Unconfigure compares the
-        # current values against THIS (not a live re-resolution) to decide
-        # what is still FCC's, so removal stays correct even when the HTTPS
-        # front is gone and live URL resolution falls back to plain HTTP.
+    backup_raw = data.get(_BACKUP_KEY)
+    backup: dict[str, object] = {}
+    if isinstance(backup_raw, dict):
+        backup = backup_raw
+    # Record the exact block this merge writes. Unconfigure compares the
+    # current values against THIS (not a live re-resolution) to decide what
+    # is still FCC's, so removal stays correct even when the HTTPS front is
+    # gone and live URL resolution falls back to plain HTTP. Refresh it on
+    # every merge: when the proxy token or gateway URL rotated since the
+    # first configure, ownership must be decided against the newest written
+    # block, not the stale first one.
+    if backup.get("managed") != managed:
         backup["managed"] = dict(managed)
+        changed = True
+    if _BACKUP_KEY not in data:
         # Omit the discovery entry when the key was absent so the restore
         # can tell "was present with this value" from "was not present".
         if had_discovery:
@@ -324,9 +334,11 @@ def unconfigure_claude_desktop_config(
         # managed key or the discovery flag after configure owns it again,
         # so preserve the current value and skip the stale snapshot entry —
         # restoring it would overwrite the user's post-install choice.
-        # Compare against the exact block the merge persisted (not a live
-        # re-resolution), so removal stays correct even when the HTTPS front
-        # is gone and live URL resolution falls back to plain HTTP.
+        # Compare against the newest block configure persisted (refreshed
+        # on every merge, not a live re-resolution), so removal stays
+        # correct both when the proxy token or gateway URL rotated between
+        # configures and when the HTTPS front is gone and live URL
+        # resolution falls back to plain HTTP.
         written_raw = backup.get("managed")
         written = written_raw if isinstance(written_raw, dict) else managed
         prior_raw = backup.get("inference")
