@@ -217,6 +217,11 @@ def configure_claude_desktop_config(
 
     if _BACKUP_KEY not in data:
         backup: dict[str, object] = {}
+        # Record the exact block this merge writes. Unconfigure compares the
+        # current values against THIS (not a live re-resolution) to decide
+        # what is still FCC's, so removal stays correct even when the HTTPS
+        # front is gone and live URL resolution falls back to plain HTTP.
+        backup["managed"] = dict(managed)
         # Omit the discovery entry when the key was absent so the restore
         # can tell "was present with this value" from "was not present".
         if had_discovery:
@@ -258,12 +263,16 @@ def unconfigure_claude_desktop_config(
     """Reverse the merge. Preserves every key outside the FCC-managed surface.
 
     When the first merge recorded a ``fccPriorConfig`` snapshot, removal is
-    lossless: every managed key is deleted, then the snapshot's prior
-    presence and values are restored, and only keys FCC originally added
-    stay gone. A non-object ``inference`` value recorded verbatim by the
-    snapshot is restored exactly. Without a snapshot (a config written
-    before backups existed or by hand) ownership is decided by the
-    recorded auth token: it is settings-derived and stable across front
+    lossless for everything FCC still owns: a managed key or the discovery
+    flag is FCC's only while its current value still matches what the merge
+    wrote, so those are deleted and the snapshot's prior presence and values
+    are restored, while values the user changed after configure are kept as
+    they are (restoring the stale snapshot entry would overwrite the user's
+    post-install choice). A non-object ``inference`` value recorded verbatim
+    by the snapshot is restored exactly, but only while the block is still
+    FCC's (the settings-derived auth token proves it). Without a snapshot (a
+    config written before backups existed or by hand) ownership is decided by
+    the recorded auth token: it is settings-derived and stable across front
     state, so when it matches the FCC token the whole block is FCC's and
     every managed key is removed — even a gateway URL that no longer
     matches current resolution because the HTTPS front is gone and
@@ -300,6 +309,8 @@ def unconfigure_claude_desktop_config(
         backup = backup_raw
 
     changed = False
+    discovery_fcc_owned = False
+    block_fcc_owned = False
 
     inference_raw = data.get(_INFERENCE_KEY)
     inference_dict: dict[str, object] = {}
@@ -308,21 +319,37 @@ def unconfigure_claude_desktop_config(
             inference_dict[str(key)] = value
 
     if backup is not None:
-        # Snapshot path: the merge recorded what FCC replaced, so the
-        # discovery flag and every managed key are FCC's — remove them
-        # all, then restore the snapshot below.
-        if _DISCOVERY_KEY in data:
+        # Snapshot path: a managed field is FCC's only while its current
+        # value still matches what the merge wrote. A user who changed a
+        # managed key or the discovery flag after configure owns it again,
+        # so preserve the current value and skip the stale snapshot entry —
+        # restoring it would overwrite the user's post-install choice.
+        # Compare against the exact block the merge persisted (not a live
+        # re-resolution), so removal stays correct even when the HTTPS front
+        # is gone and live URL resolution falls back to plain HTTP.
+        written_raw = backup.get("managed")
+        written = written_raw if isinstance(written_raw, dict) else managed
+        prior_raw = backup.get("inference")
+        prior = prior_raw if isinstance(prior_raw, dict) else {}
+        # The verbatim ``inferenceRaw`` restore below replaces the whole
+        # block; it is only safe while the block is still FCC's, which the
+        # settings-derived auth token proves (stable across front state).
+        block_fcc_owned = inference_dict.get("inferenceAnthropicApiKey") == written.get(
+            "inferenceAnthropicApiKey"
+        )
+
+        discovery_fcc_owned = data.get(_DISCOVERY_KEY) is True
+        if discovery_fcc_owned:
             del data[_DISCOVERY_KEY]
             changed = True
-        for key in managed:
-            if key in inference_dict:
+
+        for key, value in written.items():
+            if key in inference_dict and inference_dict[key] == value:
                 del inference_dict[key]
                 changed = True
-        prior_raw = backup.get("inference")
-        if isinstance(prior_raw, dict):
-            for key, value in prior_raw.items():
-                inference_dict[str(key)] = value
-                changed = True
+                if key in prior:
+                    inference_dict[str(key)] = prior[key]
+                    changed = True
     else:
         # Legacy path (no snapshot): ownership is decided by the recorded
         # auth token. The discovery flag is removed only once FCC
@@ -349,13 +376,16 @@ def unconfigure_claude_desktop_config(
             changed = True
 
     if backup is not None:
-        if "inferenceRaw" in backup:
-            # The original value was not a JSON object; restore it verbatim.
+        if block_fcc_owned and "inferenceRaw" in backup:
+            # The original value was not a JSON object; restore it verbatim,
+            # but only while the block is still FCC's — a user who replaced
+            # the whole block after configure owns it and must be preserved.
             data[_INFERENCE_KEY] = backup["inferenceRaw"]
             changed = True
-        # Restore the original discovery value when the key was present
-        # before the first merge; leave it deleted when it was absent.
-        if "discovery" in backup:
+        # Restore the original discovery value only when the flag was still
+        # FCC's (the user did not change it after configure) and the key was
+        # present before the first merge; leave it deleted when it was absent.
+        if discovery_fcc_owned and "discovery" in backup:
             data[_DISCOVERY_KEY] = backup["discovery"]
             changed = True
         del data[_BACKUP_KEY]

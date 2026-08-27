@@ -400,8 +400,11 @@ def test_configure_keeps_first_snapshot_across_remerges(
 
     data = json.loads(fake_config.read_text(encoding="utf-8"))
     # No discovery entry: the key was absent before the first merge, and
-    # the restore must delete it again rather than invent a value.
+    # the restore must delete it again rather than invent a value. The
+    # ``managed`` entry records the exact block the merge wrote so removal
+    # can decide ownership without re-resolving the gateway URL.
     assert data["fccPriorConfig"] == {
+        "managed": claude_desktop.fcc_managed_block(fake_settings),
         "inference": {
             "provider": "anthropic",
             "inferenceAnthropicApiKey": "user-secret-key",
@@ -478,6 +481,156 @@ def test_configure_unconfigure_roundtrip_restores_non_object_inference(
     )
     restored = json.loads(fake_config.read_text(encoding="utf-8"))
     assert restored == original
+
+
+def test_unconfigure_removes_written_url_when_front_is_down(
+    fake_config: Path,
+    fake_settings: Settings,
+) -> None:
+    # The snapshot records the exact block the merge wrote, so removal must
+    # compare against THAT rather than a live re-resolution: when the HTTPS
+    # front is gone (exactly when users uninstall), live URL resolution falls
+    # back to plain HTTP and no longer matches the written HTTPS URL — yet
+    # the written gateway URL and token must still be removed.
+    https_url = "https://localhost:8443/claude-desktop"
+    assert (
+        claude_desktop.configure_claude_desktop_config(
+            fake_config, settings=fake_settings, gateway_base_url=https_url
+        )
+        is True
+    )
+    configured = json.loads(fake_config.read_text(encoding="utf-8"))
+    assert configured["inference"]["inferenceGatewayBaseUrl"] == https_url
+
+    # Unconfigure without a gateway override: live resolution now yields the
+    # plain-HTTP fallback, which does not match the written HTTPS URL.
+    assert (
+        claude_desktop.unconfigure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is True
+    )
+    restored = json.loads(fake_config.read_text(encoding="utf-8"))
+    assert restored == {}
+
+
+def test_unconfigure_preserves_post_configure_inference_change(
+    fake_config: Path,
+    fake_settings: Settings,
+) -> None:
+    # Regression guard for the Greptile "unconfigure overwrites post-
+    # configuration user changes with stale snapshot values" finding: a user
+    # who edits an FCC-managed key after configure owns it again, so
+    # unconfigure must keep the new value instead of restoring the stale
+    # pre-install snapshot entry.
+    fake_config.write_text(
+        json.dumps(
+            {
+                "inference": {
+                    "provider": "anthropic",
+                    "inferenceAnthropicApiKey": "user-before",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        claude_desktop.configure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is True
+    )
+
+    # The user swaps the gateway credential after installing FCC.
+    configured = json.loads(fake_config.read_text(encoding="utf-8"))
+    configured["inference"]["inferenceAnthropicApiKey"] = "user-after"
+    fake_config.write_text(json.dumps(configured), encoding="utf-8")
+
+    assert (
+        claude_desktop.unconfigure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is True
+    )
+    restored = json.loads(fake_config.read_text(encoding="utf-8"))
+    # The user-changed credential survives; the still-FCC provider key is
+    # reverted to its pre-install value.
+    assert restored["inference"]["inferenceAnthropicApiKey"] == "user-after"
+    assert restored["inference"]["provider"] == "anthropic"
+    assert "fccPriorConfig" not in restored
+
+
+def test_unconfigure_preserves_post_configure_discovery_change(
+    fake_config: Path,
+    fake_settings: Settings,
+) -> None:
+    # A user who flips the discovery flag after configure owns it again;
+    # unconfigure must neither delete it (it is no longer FCC's) nor restore
+    # a stale snapshot value over it.
+    fake_config.write_text(
+        json.dumps({"inference": {"provider": "anthropic"}}), encoding="utf-8"
+    )
+
+    assert (
+        claude_desktop.configure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is True
+    )
+
+    configured = json.loads(fake_config.read_text(encoding="utf-8"))
+    assert configured["modelDiscoveryEnabled"] is True
+    configured["modelDiscoveryEnabled"] = False
+    fake_config.write_text(json.dumps(configured), encoding="utf-8")
+
+    assert (
+        claude_desktop.unconfigure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is True
+    )
+    restored = json.loads(fake_config.read_text(encoding="utf-8"))
+    assert restored["modelDiscoveryEnabled"] is False
+    assert "fccPriorConfig" not in restored
+
+
+def test_unconfigure_preserves_post_configure_block_replacement(
+    fake_config: Path,
+    fake_settings: Settings,
+) -> None:
+    # When the original inference value was a non-object (recorded verbatim
+    # under ``inferenceRaw``) but the user later replaced the whole block with
+    # their own object, unconfigure must keep the user's block rather than
+    # restoring the stale raw value.
+    fake_config.write_text(json.dumps({"inference": "legacy-string"}), encoding="utf-8")
+
+    assert (
+        claude_desktop.configure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is True
+    )
+
+    configured = json.loads(fake_config.read_text(encoding="utf-8"))
+    configured["inference"] = {
+        "provider": "custom",
+        "inferenceAnthropicApiKey": "user-key",
+    }
+    fake_config.write_text(json.dumps(configured), encoding="utf-8")
+
+    assert (
+        claude_desktop.unconfigure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is True
+    )
+    restored = json.loads(fake_config.read_text(encoding="utf-8"))
+    assert restored["inference"] == {
+        "provider": "custom",
+        "inferenceAnthropicApiKey": "user-key",
+    }
+    assert "fccPriorConfig" not in restored
 
 
 def test_unconfigure_roundtrip_is_clean_noop(
