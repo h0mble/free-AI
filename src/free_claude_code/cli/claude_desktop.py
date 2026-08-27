@@ -216,15 +216,23 @@ def configure_claude_desktop_config(
             inference_dict[str(key)] = value
 
     if _BACKUP_KEY not in data:
-        backup: dict[str, object] = {
-            "inference": {
-                key: value for key, value in inference_dict.items() if key in managed
-            },
-        }
+        backup: dict[str, object] = {}
         # Omit the discovery entry when the key was absent so the restore
         # can tell "was present with this value" from "was not present".
         if had_discovery:
             backup["discovery"] = prior_discovery
+        if _INFERENCE_KEY in data:
+            if isinstance(inference_raw, dict):
+                backup["inference"] = {
+                    key: value
+                    for key, value in inference_dict.items()
+                    if key in managed
+                }
+            else:
+                # The original value is not a JSON object; the merge
+                # replaces it wholesale, so record it verbatim for an
+                # exact restore.
+                backup["inferenceRaw"] = inference_raw
         data[_BACKUP_KEY] = backup
         changed = True
 
@@ -252,7 +260,9 @@ def unconfigure_claude_desktop_config(
     When the first merge recorded a ``fccPriorConfig`` snapshot, removal is
     lossless: every managed key is deleted, then the snapshot's prior
     presence and values are restored, and only keys FCC originally added
-    stay gone. Without a snapshot (a config written before backups existed
+    stay gone. A non-object ``inference`` value recorded verbatim by the
+    snapshot is restored exactly. Without a snapshot (a config written
+    before backups existed
     or by hand) ownership is decided by the recorded auth token: it is
     settings-derived and stable across front state, so when it matches the
     FCC token the whole block is FCC's and every managed key is removed —
@@ -280,7 +290,10 @@ def unconfigure_claude_desktop_config(
         return False
 
     backup_raw = data.get(_BACKUP_KEY)
-    backup: dict[str, object] = {}
+    # ``None`` means "no snapshot recorded" — an EMPTY snapshot dict is a
+    # real one (nothing prior to restore) and must still take the restore
+    # path so it gets deleted.
+    backup: dict[str, object] | None = None
     if isinstance(backup_raw, dict):
         backup = backup_raw
 
@@ -296,7 +309,7 @@ def unconfigure_claude_desktop_config(
         for key, value in inference_raw.items():
             inference_dict[str(key)] = value
 
-    if backup:
+    if backup is not None:
         for key in managed:
             if key in inference_dict:
                 del inference_dict[key]
@@ -324,7 +337,11 @@ def unconfigure_claude_desktop_config(
             del data[_INFERENCE_KEY]
             changed = True
 
-    if backup:
+    if backup is not None:
+        if "inferenceRaw" in backup:
+            # The original value was not a JSON object; restore it verbatim.
+            data[_INFERENCE_KEY] = backup["inferenceRaw"]
+            changed = True
         # Restore the original discovery value when the key was present
         # before the first merge; leave it deleted when it was absent.
         if "discovery" in backup:

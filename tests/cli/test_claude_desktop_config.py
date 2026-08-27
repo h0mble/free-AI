@@ -407,6 +407,43 @@ def test_configure_unconfigure_roundtrip_restores_disabled_discovery(
     assert restored == original
 
 
+@pytest.mark.parametrize(
+    "raw_inference",
+    ["legacy-string", ["a", "b"], None],
+    ids=["string", "list", "null"],
+)
+def test_configure_unconfigure_roundtrip_restores_non_object_inference(
+    fake_config: Path,
+    fake_settings: Settings,
+    raw_inference: object,
+) -> None:
+    # Regression guard for the Greptile "non-object inference values are
+    # not restored" finding: a valid config whose inference value is a
+    # string, list, or null must get that exact value back after a
+    # configure/unconfigure round trip, not a deleted key.
+    original = {"inference": raw_inference, "preferences": {"theme": "dark"}}
+    fake_config.write_text(json.dumps(original), encoding="utf-8")
+
+    assert (
+        claude_desktop.configure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is True
+    )
+    configured = json.loads(fake_config.read_text(encoding="utf-8"))
+    assert configured["inference"]["provider"] == "gateway"
+    assert configured["fccPriorConfig"]["inferenceRaw"] == raw_inference
+
+    assert (
+        claude_desktop.unconfigure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is True
+    )
+    restored = json.loads(fake_config.read_text(encoding="utf-8"))
+    assert restored == original
+
+
 def test_unconfigure_roundtrip_is_clean_noop(
     fake_config: Path,
     fake_settings: Settings,
