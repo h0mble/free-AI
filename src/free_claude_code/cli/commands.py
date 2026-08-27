@@ -10,8 +10,12 @@ from loguru import logger
 
 from free_claude_code.cli.launchers.common import preflight_proxy
 from free_claude_code.cli.process_registry import kill_all_best_effort
-from free_claude_code.cli.tls_proxy import CaddyTlsProxy, desktop_gateway_base_url
-from free_claude_code.config.loader import clear_settings_cache, get_settings
+from free_claude_code.config.loader import (
+    clear_settings_cache,
+    get_settings,
+    repair_invalid_managed_provider_proxies,
+)
+from free_claude_code.config.paths import managed_env_path
 from free_claude_code.config.server_urls import local_admin_url, local_proxy_root_url
 from free_claude_code.config.settings import Settings
 from free_claude_code.runtime.bootstrap import build_asgi_app
@@ -210,8 +214,20 @@ class ServerSupervisor:
 
 
 def load_server_settings() -> Settings:
-    """Return the canonical cached settings."""
+    """Return canonical settings after repairing invalid managed proxies."""
 
+    settings = get_settings()
+    removed = repair_invalid_managed_provider_proxies()
+    if not removed:
+        return settings
+
+    logger.warning(
+        "Removed invalid managed provider proxy settings from {}: {}. "
+        "Configure valid proxy URLs in Admin if needed.",
+        managed_env_path(),
+        ", ".join(removed),
+    )
+    clear_settings_cache()
     return get_settings()
 
 
