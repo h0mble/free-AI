@@ -196,7 +196,7 @@ class ServerSupervisor:
         tls_front = CaddyTlsProxy(settings)
         readiness: threading.Thread | None = None
         try:
-            front_started = tls_front.start()
+            tls_front.start()
             # Publish the desktop-scoped gateway URL this generation serves.
             # The plain-HTTP fallback is correct until the front verifies,
             # and verification needs FCC's /health marker THROUGH the front,
@@ -205,7 +205,13 @@ class ServerSupervisor:
             # TLS-prefixed URL the moment the front verifies, keeping the
             # HTTPS URL published for the whole live serving window.
             self._publish_desktop_gateway_url(settings)
-            if front_started:
+            # Run the readiness whenever a front MAY own the TLS port, not
+            # only when managed startup succeeded: an external reverse proxy
+            # already bound there fails the pre-Uvicorn probe and makes the
+            # managed caddy exit on the occupied port (``start()`` -> False),
+            # yet it still serves FCC's /health once Uvicorn is up. Gating on
+            # ``start()`` would strand such a front on the HTTP fallback.
+            if settings.tls_proxy_enabled:
                 readiness = self._start_gateway_https_readiness(settings)
             if open_admin_browser:
                 schedule_open_admin_browser(settings)

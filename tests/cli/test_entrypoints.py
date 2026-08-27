@@ -525,21 +525,26 @@ def test_serve_supervisor_orders_tls_front_around_each_generation() -> None:
 
 
 @pytest.mark.parametrize(
-    ("front_started", "probe_verifies", "expected_final"),
+    ("tls_proxy_enabled", "front_started", "probe_verifies", "expected_final"),
     [
-        # Front up and verifying once Uvicorn serves: the generation starts
-        # on the plain-HTTP fallback and upgrades to the TLS-prefixed URL
-        # while the server is still serving.
-        (True, True, "https://localhost:18443/claude-desktop"),
+        # Managed front up and verifying once Uvicorn serves: the generation
+        # starts on the plain-HTTP fallback and upgrades to the TLS-prefixed
+        # URL while the server is still serving.
+        (True, True, True, "https://localhost:18443/claude-desktop"),
         # Front started but its health probe never verifies: the plain-HTTP
         # fallback stays for the whole generation.
-        (True, False, "http://127.0.0.1:8082/claude-desktop"),
-        # No front at all (disabled or failed to start): plain HTTP, and no
-        # readiness probing happens.
-        (False, None, "http://127.0.0.1:8082/claude-desktop"),
+        (True, True, False, "http://127.0.0.1:8082/claude-desktop"),
+        # An external reverse proxy already owns the TLS port: managed
+        # startup reports False (its pre-Uvicorn probe fails and the managed
+        # caddy exits on the occupied port), but the readiness task still
+        # runs and upgrades to HTTPS once the external front serves FCC.
+        (True, False, True, "https://localhost:18443/claude-desktop"),
+        # TLS disabled entirely: plain HTTP, and no readiness probing.
+        (False, False, None, "http://127.0.0.1:8082/claude-desktop"),
     ],
 )
 def test_serve_publishes_desktop_gateway_url_matching_tls_readiness(
+    tls_proxy_enabled: bool,
     front_started: bool,
     probe_verifies: bool | None,
     expected_final: str,
@@ -547,19 +552,21 @@ def test_serve_publishes_desktop_gateway_url_matching_tls_readiness(
     """The supervisor publishes the live desktop-scoped gateway URL.
 
     End-to-end guard for the Greptile "HTTPS gateway is published after
-    shutdown" finding: the front can only pass FCC's ``/health`` marker
-    probe while Uvicorn serves, so a concurrent readiness task probes
-    during ``server.run()`` and the TLS-prefixed URL becomes readable
-    DURING the live serving window — not after it ends. The fallback is
-    preserved when the front failed to start or never verifies. The URL is
-    cleared once the supervisor shuts down so a stopped server never
-    advertises a dead endpoint.
+    shutdown" and "external front readiness is ignored" findings: the front
+    can only pass FCC's ``/health`` marker probe while Uvicorn serves, so a
+    concurrent readiness task probes during ``server.run()`` whenever a
+    front may own the TLS port — including an external front that made
+    managed startup fail — and the TLS-prefixed URL becomes readable DURING
+    the live serving window, not after it ends. The fallback is preserved
+    when TLS is disabled or the front never verifies. The URL is cleared
+    once the supervisor shuts down so a stopped server never advertises a
+    dead endpoint.
     """
     from free_claude_code.cli import commands
 
     settings = _launcher_settings(port=8082).model_copy(
         update={
-            "tls_proxy_enabled": True,
+            "tls_proxy_enabled": tls_proxy_enabled,
             "tls_proxy_port": 18443,
             "desktop_gateway_prefix": "claude-desktop",
         }
@@ -640,9 +647,11 @@ def test_serve_publishes_desktop_gateway_url_matching_tls_readiness(
     assert published_during_run[-1] == expected_final
     # ...and it stays published until the generation actually stops.
     assert published_at_stop == [expected_final]
-    if front_started:
-        # The readiness task probes at least once; a never-healthy front
-        # retries until the deadline, so only assert presence.
+    if tls_proxy_enabled:
+        # The readiness task probes at least once whenever a front may own
+        # the TLS port — including an external front that made managed
+        # startup fail; a never-healthy front retries until the deadline,
+        # so only assert presence.
         assert probe_calls
     else:
         assert probe_calls == []
