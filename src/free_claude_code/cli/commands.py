@@ -10,6 +10,7 @@ from loguru import logger
 
 from free_claude_code.cli.launchers.common import preflight_proxy
 from free_claude_code.cli.process_registry import kill_all_best_effort
+from free_claude_code.cli.tls_proxy import CaddyTlsProxy, desktop_gateway_base_url
 from free_claude_code.config.loader import (
     clear_settings_cache,
     get_settings,
