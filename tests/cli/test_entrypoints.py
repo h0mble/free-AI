@@ -358,6 +358,7 @@ def test_serve_supervisor_restarts_when_app_requests_restart() -> None:
         patch.object(commands.uvicorn, "Server", side_effect=FakeServer),
         patch.object(commands, "build_asgi_app", side_effect=build_asgi_app),
         patch.object(commands, "CaddyTlsProxy") as tls_proxy,
+        patch.object(commands, "GATEWAY_HEALTH_UPGRADE_SECONDS", 0.0),
         patch.object(commands, "schedule_open_admin_browser") as schedule_open_admin,
         patch.object(commands, "clear_settings_cache") as clear_settings_cache,
         patch.object(commands, "kill_all_best_effort") as kill_all,
@@ -406,6 +407,7 @@ def test_serve_supervisor_refuses_restart_after_incomplete_shutdown() -> None:
         patch.object(commands.uvicorn, "Server", side_effect=FakeServer),
         patch.object(commands, "build_asgi_app", side_effect=build_asgi_app),
         patch.object(commands, "CaddyTlsProxy") as tls_proxy,
+        patch.object(commands, "GATEWAY_HEALTH_UPGRADE_SECONDS", 0.0),
         patch.object(commands, "schedule_open_admin_browser"),
         patch.object(commands, "clear_settings_cache") as clear_settings_cache,
         patch.object(commands, "kill_all_best_effort") as kill_all,
@@ -469,12 +471,18 @@ def test_serve_supervisor_orders_tls_front_around_each_generation() -> None:
     def fake_config(app, **kwargs):
         return SimpleNamespace(app=app, kwargs=kwargs)
 
+    def record_upgrade(*_args: object) -> bool:
+        events.append("upgrade")
+        return True
+
     with (
         patch.object(commands, "get_settings", get_settings),
         patch.object(commands.uvicorn, "Config", side_effect=fake_config),
         patch.object(commands.uvicorn, "Server", side_effect=FakeServer),
         patch.object(commands, "build_asgi_app", side_effect=build_asgi_app),
         patch.object(commands, "CaddyTlsProxy", side_effect=FakeTlsProxy),
+        patch.object(commands, "GATEWAY_HEALTH_UPGRADE_SECONDS", 0.5),
+        patch.object(commands, "probe_fcc_front", side_effect=record_upgrade),
         patch.object(commands, "schedule_open_admin_browser"),
         patch.object(commands, "clear_settings_cache"),
         patch.object(commands, "kill_all_best_effort"),
@@ -485,28 +493,48 @@ def test_serve_supervisor_orders_tls_front_around_each_generation() -> None:
         "construct",
         "start",
         "server-run",
+        "upgrade",
         "stop",
         "construct",
         "start",
         "server-run",
+        "upgrade",
         "stop",
     ]
 
 
-@pytest.mark.parametrize("tls_ready", [True, False])
+@pytest.mark.parametrize(
+    ("front_started", "probe_after_start", "expected_final"),
+    [
+        # Front up and verifying once Uvicorn serves: the generation starts
+        # on the plain-HTTP fallback and upgrades to the TLS-prefixed URL.
+        (True, True, "https://localhost:18443/claude-desktop"),
+        # Front started but its health probe never verifies: the plain-HTTP
+        # fallback stays for the whole generation.
+        (True, False, "http://127.0.0.1:8082/claude-desktop"),
+        # No front at all (disabled or failed to start): plain HTTP, and no
+        # post-start health probing happens.
+        (False, None, "http://127.0.0.1:8082/claude-desktop"),
+    ],
+)
 def test_serve_publishes_desktop_gateway_url_matching_tls_readiness(
-    tls_ready: bool,
+    front_started: bool,
+    probe_after_start: bool | None,
+    expected_final: str,
 ) -> None:
     """The supervisor publishes the live desktop-scoped gateway URL.
 
-    End-to-end guard for the Greptile "desktop gateway URL is
-    unpublished" finding: after the generation's HTTPS front is started,
-    ``desktop_gateway_url()`` resolves to the TLS-prefixed endpoint when a
-    front answers, and to the plain-HTTP fallback when it does not. The URL
-    is cleared once the supervisor shuts down so a stopped server never
-    advertises a dead endpoint.
+    End-to-end guard for the Greptile "desktop gateway URL is permanently
+    published as HTTP before Uvicorn makes the managed HTTPS proxy healthy"
+    finding: resolution needs FCC's ``/health`` marker through the front,
+    which cannot answer before Uvicorn serves, so the generation publishes
+    the plain-HTTP fallback first and upgrades to the TLS-prefixed URL only
+    after the server has run and the front's health probe succeeds. The
+    fallback is preserved when the front failed to start or never verifies.
+    The URL is cleared once the supervisor shuts down so a stopped server
+    never advertises a dead endpoint.
     """
-    from free_claude_code.cli import commands, tls_proxy
+    from free_claude_code.cli import commands
 
     settings = _launcher_settings(port=8082).model_copy(
         update={
@@ -515,13 +543,28 @@ def test_serve_publishes_desktop_gateway_url_matching_tls_readiness(
             "desktop_gateway_prefix": "claude-desktop",
         }
     )
-    published: list[str | None] = []
+    published_during_run: list[str | None] = []
+    published_at_stop: list[str | None] = []
+    probe_calls: list[str] = []
 
     def build_asgi_app(_settings: Settings, restart_callback: Callable[[], None]):
         return SimpleNamespace(runtime=SimpleNamespace(is_closed=False))
 
     def fake_config(app, **kwargs):
         return SimpleNamespace(app=app, kwargs=kwargs)
+
+    class FakeTlsProxy:
+        def __init__(self, proxy_settings: Settings) -> None:
+            assert proxy_settings is settings
+
+        def start(self) -> bool:
+            return front_started
+
+        def stop(self) -> None:
+            # ``stop()`` runs in the generation's ``finally`` after the
+            # post-start upgrade and before the supervisor clears the URL,
+            # so it observes the final published value.
+            published_at_stop.append(supervisor.desktop_gateway_url())
 
     supervisor = commands.ServerSupervisor(console_logging=False)
 
@@ -532,28 +575,40 @@ def test_serve_publishes_desktop_gateway_url_matching_tls_readiness(
 
         def run(self):
             # Capture the URL the generation published while it is live.
-            published.append(supervisor.desktop_gateway_url())
+            published_during_run.append(supervisor.desktop_gateway_url())
             self.config.app.runtime.is_closed = True
+
+    def fake_probe(*_args: object) -> bool:
+        probe_calls.append("probe")
+        assert probe_after_start is not None
+        return probe_after_start
 
     with (
         patch.object(commands, "load_server_settings", return_value=settings),
         patch.object(commands.uvicorn, "Config", side_effect=fake_config),
         patch.object(commands.uvicorn, "Server", side_effect=FakeServer),
         patch.object(commands, "build_asgi_app", side_effect=build_asgi_app),
-        patch.object(commands, "CaddyTlsProxy"),
-        patch.object(tls_proxy, "probe_fcc_front", return_value=tls_ready),
+        patch.object(commands, "CaddyTlsProxy", side_effect=FakeTlsProxy),
+        patch.object(commands, "GATEWAY_HEALTH_UPGRADE_SECONDS", 0.5),
+        patch.object(commands, "probe_fcc_front", side_effect=fake_probe),
         patch.object(commands, "schedule_open_admin_browser"),
         patch.object(commands, "kill_all_best_effort"),
     ):
         assert supervisor.desktop_gateway_url() is None
         supervisor.run(open_admin_browser=False)
 
-    expected = (
-        "https://localhost:18443/claude-desktop"
-        if tls_ready
-        else "http://127.0.0.1:8082/claude-desktop"
-    )
-    assert published == [expected]
+    # Before Uvicorn serves, the front cannot verify FCC's health marker,
+    # so the live publication is always the plain-HTTP fallback.
+    assert published_during_run == ["http://127.0.0.1:8082/claude-desktop"]
+    # After the server has run, the generation's final URL matches the
+    # front's verified state.
+    assert published_at_stop == [expected_final]
+    if front_started:
+        # The post-start health probe runs at least once; a never-healthy
+        # front retries until the upgrade deadline, so only assert presence.
+        assert probe_calls
+    else:
+        assert probe_calls == []
     # Cleared on shutdown so a stopped server advertises nothing.
     assert supervisor.desktop_gateway_url() is None
 

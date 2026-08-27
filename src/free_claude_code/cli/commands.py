@@ -10,7 +10,12 @@ from loguru import logger
 
 from free_claude_code.cli.launchers.common import preflight_proxy
 from free_claude_code.cli.process_registry import kill_all_best_effort
-from free_claude_code.cli.tls_proxy import CaddyTlsProxy, desktop_gateway_base_url
+from free_claude_code.cli.tls_proxy import (
+    CaddyTlsProxy,
+    desktop_gateway_base_url,
+    probe_fcc_front,
+    tls_root_url,
+)
 from free_claude_code.config.loader import (
     clear_settings_cache,
     get_settings,
@@ -22,6 +27,7 @@ from free_claude_code.config.settings import Settings
 from free_claude_code.runtime.bootstrap import build_asgi_app
 
 SERVER_GRACEFUL_SHUTDOWN_SECONDS = 5
+GATEWAY_HEALTH_UPGRADE_SECONDS = 10.0
 
 
 def serve() -> None:
@@ -189,17 +195,21 @@ class ServerSupervisor:
         # ``start()`` never raises and falls back to plain HTTP on failure.
         tls_front = CaddyTlsProxy(settings)
         try:
-            tls_front.start()
-            # Publish the desktop-scoped gateway URL this generation serves:
-            # the HTTPS root when the front answered, else the plain-HTTP
-            # fallback. Desktop integrations read this instead of guessing.
-            gateway_url = desktop_gateway_base_url(settings)
-            with self._lock:
-                self._desktop_gateway_url = gateway_url
-            logger.info("Claude Desktop gateway: {}", gateway_url)
+            front_started = tls_front.start()
+            # Publish the desktop-scoped gateway URL this generation serves.
+            # Resolution needs FCC's /health marker THROUGH the front, which
+            # only answers once Uvicorn accepts the proxied request — so
+            # before ``server.run()`` an adopted or freshly started front
+            # cannot verify yet and resolution would fall back to plain HTTP.
+            # Publish the plain-HTTP fallback first (correct whenever no
+            # front is coming), then upgrade to the TLS-prefixed URL once
+            # the server serves and the front verifies. Desktop integrations
+            # read the live value instead of guessing.
+            self._publish_desktop_gateway_url(settings)
             if open_admin_browser:
                 schedule_open_admin_browser(settings)
             server.run()
+            self._upgrade_desktop_gateway_to_https(settings, front_started)
         finally:
             tls_front.stop()
 
@@ -209,6 +219,45 @@ class ServerSupervisor:
             restart_requested = self._restart_generation != restart_generation
             stop_requested = self._stop_requested
         return restart_requested and not stop_requested and asgi_app.runtime.is_closed
+
+    def _publish_desktop_gateway_url(self, settings: Settings) -> None:
+        """Publish the resolved desktop gateway URL for this generation."""
+
+        gateway_url = desktop_gateway_base_url(settings)
+        with self._lock:
+            self._desktop_gateway_url = gateway_url
+        logger.info("Claude Desktop gateway: {}", gateway_url)
+
+    def _upgrade_desktop_gateway_to_https(
+        self,
+        settings: Settings,
+        front_started: bool,
+    ) -> None:
+        """Swap the published gateway URL to HTTPS once the front verifies.
+
+        Runs after ``server.run()`` returns: Uvicorn has served and shut
+        down, so the front can now pass FCC's ``/health`` marker probe.
+        Skipped when no front is up (disabled, failed to start, or an
+        adopted front stopped verifying) — the plain-HTTP fallback already
+        published then stays, matching the only conditions where HTTP is
+        legitimate.
+        """
+
+        if not front_started:
+            return
+        root = tls_root_url(settings)
+        deadline = time.monotonic() + GATEWAY_HEALTH_UPGRADE_SECONDS
+        while time.monotonic() < deadline:
+            if probe_fcc_front(root):
+                # The front verified, so publish the TLS-prefixed URL
+                # directly — re-resolving would probe the front a second
+                # time for the same answer.
+                gateway_url = desktop_gateway_base_url(settings, base_url=root)
+                with self._lock:
+                    self._desktop_gateway_url = gateway_url
+                logger.info("Claude Desktop gateway: {}", gateway_url)
+                return
+            time.sleep(0.25)
 
     def _request_runtime_restart(self) -> None:
         self.request_restart()

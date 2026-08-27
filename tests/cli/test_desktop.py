@@ -317,6 +317,57 @@ def test_desktop_controller_exposes_live_gateway_url_from_server() -> None:
     assert controller.desktop_gateway_url() == "https://localhost:18443/claude-desktop"
 
 
+def test_tray_status_consumes_published_gateway_url() -> None:
+    """The desktop tray surface reads the supervisor-published gateway URL.
+
+    Regression guard for the Greptile "desktop gateway URL is unconsumed"
+    finding: the tray's status notification is a production consumer of
+    ``DesktopController.desktop_gateway_url()``, reporting the TLS-prefixed
+    HTTPS endpoint when a front verifies and the plain-HTTP fallback
+    otherwise — and only the process state before any URL is published.
+    """
+    from free_claude_code.cli.desktop_tray import status_notification
+
+    class PublishingSupervisor:
+        status = ServerStatus.RUNNING
+        gateway: str | None = None
+
+        def schedule_run(self) -> bool:
+            return True
+
+        def run(self, *, open_admin_browser: bool | None = None) -> None:
+            return None
+
+        def request_restart(self) -> bool:
+            return True
+
+        def request_stop(self) -> None:
+            return None
+
+        def desktop_gateway_url(self) -> str | None:
+            return self.gateway
+
+    supervisor = PublishingSupervisor()
+    controller = DesktopController(supervisor, MagicMock(), MagicMock())
+
+    # Before the server publishes a URL, only the process state is shown.
+    assert status_notification(controller) == "Server is Running."
+
+    # HTTPS front verified: the TLS-prefixed endpoint is surfaced.
+    supervisor.gateway = "https://localhost:18443/claude-desktop"
+    assert (
+        status_notification(controller)
+        == "Server is Running. Gateway: https://localhost:18443/claude-desktop"
+    )
+
+    # Plain-HTTP fallback: the fallback endpoint is surfaced.
+    supervisor.gateway = "http://127.0.0.1:8082/claude-desktop"
+    assert (
+        status_notification(controller)
+        == "Server is Running. Gateway: http://127.0.0.1:8082/claude-desktop"
+    )
+
+
 def test_desktop_quit_stops_the_managed_tls_front() -> None:
     """The desktop quit path tears down the HTTPS front with the server.
 
@@ -381,6 +432,8 @@ def test_desktop_quit_stops_the_managed_tls_front() -> None:
             return_value=SimpleNamespace(runtime=SimpleNamespace(is_closed=False)),
         ),
         patch.object(commands, "CaddyTlsProxy", side_effect=FakeTlsProxy),
+        patch.object(commands, "GATEWAY_HEALTH_UPGRADE_SECONDS", 0.5),
+        patch.object(commands, "probe_fcc_front", return_value=True),
         patch.object(commands, "schedule_open_admin_browser"),
         patch.object(commands, "kill_all_best_effort"),
     ):
