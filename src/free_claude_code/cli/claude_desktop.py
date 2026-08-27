@@ -191,8 +191,11 @@ def configure_claude_desktop_config(
     changed = False
 
     # The snapshot must observe the config BEFORE the merge touches it, so
-    # capture the discovery flag's prior presence first.
+    # capture the discovery flag's prior presence and value first: presence
+    # alone is not enough, since a user who explicitly disabled discovery
+    # must get ``false`` back, not ``true``.
     had_discovery = _DISCOVERY_KEY in data
+    prior_discovery = data.get(_DISCOVERY_KEY)
 
     if data.get(_DISCOVERY_KEY) is not True:
         data[_DISCOVERY_KEY] = True
@@ -205,12 +208,16 @@ def configure_claude_desktop_config(
             inference_dict[str(key)] = value
 
     if _BACKUP_KEY not in data:
-        data[_BACKUP_KEY] = {
-            "hadDiscovery": had_discovery,
+        backup: dict[str, object] = {
             "inference": {
                 key: value for key, value in inference_dict.items() if key in managed
             },
         }
+        # Omit the discovery entry when the key was absent so the restore
+        # can tell "was present with this value" from "was not present".
+        if had_discovery:
+            backup["discovery"] = prior_discovery
+        data[_BACKUP_KEY] = backup
         changed = True
 
     for key, value in managed.items():
@@ -310,8 +317,10 @@ def unconfigure_claude_desktop_config(
             changed = True
 
     if backup:
-        if backup.get("hadDiscovery") is True:
-            data[_DISCOVERY_KEY] = True
+        # Restore the original discovery value when the key was present
+        # before the first merge; leave it deleted when it was absent.
+        if "discovery" in backup:
+            data[_DISCOVERY_KEY] = backup["discovery"]
             changed = True
         del data[_BACKUP_KEY]
         changed = True

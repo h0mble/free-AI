@@ -363,13 +363,48 @@ def test_configure_keeps_first_snapshot_across_remerges(
     )
 
     data = json.loads(fake_config.read_text(encoding="utf-8"))
+    # No discovery entry: the key was absent before the first merge, and
+    # the restore must delete it again rather than invent a value.
     assert data["fccPriorConfig"] == {
-        "hadDiscovery": False,
         "inference": {
             "provider": "anthropic",
             "inferenceAnthropicApiKey": "user-secret-key",
         },
     }
+
+
+def test_configure_unconfigure_roundtrip_restores_disabled_discovery(
+    fake_config: Path,
+    fake_settings: Settings,
+) -> None:
+    # Regression guard for the Greptile "discovery value restores
+    # incorrectly" finding: a user who explicitly disabled model discovery
+    # must get ``false`` back after unconfigure — presence alone would
+    # restore ``true`` and permanently flip the preference.
+    original = {
+        "modelDiscoveryEnabled": False,
+        "inference": {"provider": "anthropic"},
+    }
+    fake_config.write_text(json.dumps(original), encoding="utf-8")
+
+    assert (
+        claude_desktop.configure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is True
+    )
+    configured = json.loads(fake_config.read_text(encoding="utf-8"))
+    assert configured["modelDiscoveryEnabled"] is True
+    assert configured["fccPriorConfig"]["discovery"] is False
+
+    assert (
+        claude_desktop.unconfigure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is True
+    )
+    restored = json.loads(fake_config.read_text(encoding="utf-8"))
+    assert restored == original
 
 
 def test_unconfigure_roundtrip_is_clean_noop(
