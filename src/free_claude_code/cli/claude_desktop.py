@@ -262,16 +262,18 @@ def unconfigure_claude_desktop_config(
     presence and values are restored, and only keys FCC originally added
     stay gone. A non-object ``inference`` value recorded verbatim by the
     snapshot is restored exactly. Without a snapshot (a config written
-    before backups existed
-    or by hand) ownership is decided by the recorded auth token: it is
-    settings-derived and stable across front state, so when it matches the
-    FCC token the whole block is FCC's and every managed key is removed —
-    even a gateway URL that no longer matches current resolution because
-    the HTTPS front is gone and resolution fell back to plain HTTP. Without
-    that token match only keys whose recorded values exactly match current
-    resolution are removed, so user-owned values that share FCC key names
-    survive. Returns ``False`` without writing when the existing config is
-    malformed, or silently when the file does not exist.
+    before backups existed or by hand) ownership is decided by the
+    recorded auth token: it is settings-derived and stable across front
+    state, so when it matches the FCC token the whole block is FCC's and
+    every managed key is removed — even a gateway URL that no longer
+    matches current resolution because the HTTPS front is gone and
+    resolution fell back to plain HTTP — along with the discovery flag.
+    Without that token match only keys whose recorded values exactly
+    match current resolution are removed, so user-owned values that share
+    FCC key names survive, and the discovery flag is preserved because
+    ownership is ambiguous. Returns ``False`` without writing when the
+    existing config is malformed, or silently when the file does not
+    exist.
     """
 
     resolved_settings = settings or get_settings()
@@ -299,10 +301,6 @@ def unconfigure_claude_desktop_config(
 
     changed = False
 
-    if _DISCOVERY_KEY in data:
-        del data[_DISCOVERY_KEY]
-        changed = True
-
     inference_raw = data.get(_INFERENCE_KEY)
     inference_dict: dict[str, object] = {}
     if isinstance(inference_raw, dict):
@@ -310,6 +308,12 @@ def unconfigure_claude_desktop_config(
             inference_dict[str(key)] = value
 
     if backup is not None:
+        # Snapshot path: the merge recorded what FCC replaced, so the
+        # discovery flag and every managed key are FCC's — remove them
+        # all, then restore the snapshot below.
+        if _DISCOVERY_KEY in data:
+            del data[_DISCOVERY_KEY]
+            changed = True
         for key in managed:
             if key in inference_dict:
                 del inference_dict[key]
@@ -319,9 +323,16 @@ def unconfigure_claude_desktop_config(
             for key, value in prior_raw.items():
                 inference_dict[str(key)] = value
                 changed = True
-    elif inference_dict:
+    else:
+        # Legacy path (no snapshot): ownership is decided by the recorded
+        # auth token. The discovery flag is removed only once FCC
+        # ownership is established — deleting it first would erase a
+        # user-owned preference from a hand-authored or legacy config.
         managed_token = managed["inferenceAnthropicApiKey"]
         fcc_owned = inference_dict.get("inferenceAnthropicApiKey") == managed_token
+        if fcc_owned and _DISCOVERY_KEY in data:
+            del data[_DISCOVERY_KEY]
+            changed = True
         for key, value in managed.items():
             recorded = inference_dict.get(key)
             if recorded is not None and (fcc_owned or recorded == value):

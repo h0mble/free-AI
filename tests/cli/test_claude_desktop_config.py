@@ -257,7 +257,9 @@ def test_unconfigure_preserves_user_values_sharing_fcc_key_names(
     # Regression guard for the Greptile "unconfigure erases user settings"
     # finding: keys that share FCC-managed names but hold values FCC never
     # wrote (neither the current resolution nor the FCC auth token) belong
-    # to the user and must survive removal.
+    # to the user and must survive removal. Without a snapshot the
+    # discovery flag is user-owned too — ownership is ambiguous, so it
+    # must be preserved rather than deleted.
     fake_config.write_text(
         json.dumps(
             {
@@ -276,14 +278,48 @@ def test_unconfigure_preserves_user_values_sharing_fcc_key_names(
         fake_config, settings=fake_settings
     )
 
-    assert changed is True
+    # Nothing in the config is FCC-owned, so removal is a no-op and the
+    # file is left exactly as the user wrote it.
+    assert changed is False
     data = json.loads(fake_config.read_text(encoding="utf-8"))
-    assert "modelDiscoveryEnabled" not in data
+    assert data["modelDiscoveryEnabled"] is True
     assert data["inference"] == {
         "provider": "anthropic",
         "inferenceGatewayBaseUrl": "https://api.user-gateway.example",
         "inferenceAnthropicApiKey": "user-secret-key",
     }
+
+
+def test_unconfigure_removes_discovery_when_legacy_token_marks_ownership(
+    fake_config: Path,
+    fake_settings: Settings,
+) -> None:
+    # Regression guard for the Greptile "unconfigure deletes legacy
+    # discovery preference" finding: without a snapshot the discovery
+    # flag may only be removed once FCC ownership is established by the
+    # recorded auth token — never before.
+    fake_config.write_text(
+        json.dumps(
+            {
+                "modelDiscoveryEnabled": True,
+                "inference": {
+                    "provider": "gateway",
+                    "inferenceGatewayBaseUrl": "https://localhost:8443/claude-desktop",
+                    "inferenceAnthropicApiKey": "tok-123",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    changed = claude_desktop.unconfigure_claude_desktop_config(
+        fake_config, settings=fake_settings
+    )
+
+    assert changed is True
+    data = json.loads(fake_config.read_text(encoding="utf-8"))
+    assert "modelDiscoveryEnabled" not in data
+    assert "inference" not in data
 
 
 def test_configure_unconfigure_roundtrip_restores_prior_settings(
