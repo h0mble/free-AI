@@ -286,6 +286,92 @@ def test_unconfigure_preserves_user_values_sharing_fcc_key_names(
     }
 
 
+def test_configure_unconfigure_roundtrip_restores_prior_settings(
+    fake_config: Path,
+    fake_settings: Settings,
+) -> None:
+    # Regression guard for the Greptile "unconfigure drops prior settings"
+    # finding: configure overwrites the user's own provider, gateway, and
+    # credential values, so unconfigure must restore the originals instead
+    # of deleting them.
+    original = {
+        "modelDiscoveryEnabled": True,
+        "preferences": {"theme": "dark"},
+        "inference": {
+            "provider": "anthropic",
+            "credentialKind": "oauth",
+            "inferenceProvider": "anthropic",
+            "inferenceCredentialKind": "oauth",
+            "inferenceGatewayBaseUrl": "https://api.user-gateway.example",
+            "inferenceGatewayAuthScheme": "bearer",
+            "inferenceAnthropicApiKey": "user-secret-key",
+            "extra_user_key": "stay",
+        },
+    }
+    fake_config.write_text(json.dumps(original), encoding="utf-8")
+
+    assert (
+        claude_desktop.configure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is True
+    )
+    configured = json.loads(fake_config.read_text(encoding="utf-8"))
+    assert configured["inference"]["provider"] == "gateway"
+    assert configured["inference"]["inferenceAnthropicApiKey"] == "tok-123"
+
+    assert (
+        claude_desktop.unconfigure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is True
+    )
+    restored = json.loads(fake_config.read_text(encoding="utf-8"))
+    assert restored == original
+
+
+def test_configure_keeps_first_snapshot_across_remerges(
+    fake_config: Path,
+    fake_settings: Settings,
+) -> None:
+    # The snapshot must record the user's ORIGINAL values: a re-merge that
+    # refreshed it with FCC's own block would make unconfigure "restore"
+    # the FCC values instead of the user's.
+    fake_config.write_text(
+        json.dumps(
+            {
+                "inference": {
+                    "provider": "anthropic",
+                    "inferenceAnthropicApiKey": "user-secret-key",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        claude_desktop.configure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is True
+    )
+    assert (
+        claude_desktop.configure_claude_desktop_config(
+            fake_config, settings=fake_settings
+        )
+        is False
+    )
+
+    data = json.loads(fake_config.read_text(encoding="utf-8"))
+    assert data["fccPriorConfig"] == {
+        "hadDiscovery": False,
+        "inference": {
+            "provider": "anthropic",
+            "inferenceAnthropicApiKey": "user-secret-key",
+        },
+    }
+
+
 def test_unconfigure_roundtrip_is_clean_noop(
     fake_config: Path,
     fake_settings: Settings,

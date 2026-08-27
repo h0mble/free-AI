@@ -4,6 +4,8 @@ import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from free_claude_code.cli.commands import ServerStatus, ServerSupervisor
 from free_claude_code.cli.desktop import DesktopController
 from free_claude_code.config.settings import Settings
@@ -278,7 +280,9 @@ def test_existing_server_with_https_front_gets_routing_merge() -> None:
     instance_lock.release.assert_called_once_with()
 
 
-def test_existing_server_without_https_front_is_left_unmerged() -> None:
+def test_existing_server_without_https_front_is_left_unmerged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     from free_claude_code.cli import desktop
 
     settings = _settings()
@@ -303,6 +307,13 @@ def test_existing_server_without_https_front_is_left_unmerged() -> None:
     # that would outlive the process unmanaged.
     tls_proxy.return_value.start.assert_not_called()
     instance_lock.release.assert_called_once_with()
+    # The warning must name the step that actually changes the condition:
+    # relaunching against the same HTTP-only server repeats this branch,
+    # so "then relaunch" would be a dead end.
+    assert any(
+        "stop the running HTTP-only FCC server" in record.message
+        for record in caplog.records
+    )
 
 
 def test_existing_server_with_impersonated_front_is_left_unmerged() -> None:

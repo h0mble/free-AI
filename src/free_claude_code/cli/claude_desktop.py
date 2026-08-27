@@ -51,6 +51,10 @@ CONFIG_FILENAME = "claude_desktop_config.json"
 _DISCOVERY_KEY = "modelDiscoveryEnabled"
 _INFERENCE_KEY = "inference"
 
+# Snapshot of the managed surface taken before the first merge, so
+# ``unconfigure`` restores exactly what the user had instead of deleting it.
+_BACKUP_KEY = "fccPriorConfig"
+
 # Per-platform candidate locations beyond PATH. First existing hit wins.
 _BINARY_CANDIDATES: dict[str, tuple[str, ...]] = {
     "darwin": ("/Applications/Claude.app/Contents/MacOS/Claude",),
@@ -158,6 +162,13 @@ def configure_claude_desktop_config(
 ) -> bool:
     """Merge the FCC routing block into ``path``. Returns whether anything changed.
 
+    Before the first merge the prior presence and values of the managed
+    surface (the discovery flag and the inference keys FCC overwrites) are
+    snapshotted under ``fccPriorConfig``; ``unconfigure`` restores that
+    snapshot so temporarily enabling FCC never destroys the user's previous
+    provider, gateway, credential, or discovery settings. Re-merges keep the
+    original snapshot untouched.
+
     Returns ``False`` without writing when the existing config is malformed
     (invalid JSON or non-object root). Creates a new config when absent.
     """
@@ -179,6 +190,10 @@ def configure_claude_desktop_config(
 
     changed = False
 
+    # The snapshot must observe the config BEFORE the merge touches it, so
+    # capture the discovery flag's prior presence first.
+    had_discovery = _DISCOVERY_KEY in data
+
     if data.get(_DISCOVERY_KEY) is not True:
         data[_DISCOVERY_KEY] = True
         changed = True
@@ -188,6 +203,15 @@ def configure_claude_desktop_config(
     if isinstance(inference_raw, dict):
         for key, value in inference_raw.items():
             inference_dict[str(key)] = value
+
+    if _BACKUP_KEY not in data:
+        data[_BACKUP_KEY] = {
+            "hadDiscovery": had_discovery,
+            "inference": {
+                key: value for key, value in inference_dict.items() if key in managed
+            },
+        }
+        changed = True
 
     for key, value in managed.items():
         if inference_dict.get(key) != value:
@@ -210,14 +234,18 @@ def unconfigure_claude_desktop_config(
 ) -> bool:
     """Reverse the merge. Preserves every key outside the FCC-managed surface.
 
-    Ownership is decided by the recorded auth token: it is settings-derived
-    and stable across front state, so when it matches the FCC token the
-    whole block is FCC's and every managed key is removed — even a gateway
-    URL that no longer matches current resolution because the HTTPS front
-    is gone and resolution fell back to plain HTTP. Without that token
-    match only keys whose recorded values exactly match current resolution
-    are removed, so user-owned values that share FCC key names survive.
-    Returns ``False`` without writing when the existing config is
+    When the first merge recorded a ``fccPriorConfig`` snapshot, removal is
+    lossless: every managed key is deleted, then the snapshot's prior
+    presence and values are restored, and only keys FCC originally added
+    stay gone. Without a snapshot (a config written before backups existed
+    or by hand) ownership is decided by the recorded auth token: it is
+    settings-derived and stable across front state, so when it matches the
+    FCC token the whole block is FCC's and every managed key is removed —
+    even a gateway URL that no longer matches current resolution because
+    the HTTPS front is gone and resolution fell back to plain HTTP. Without
+    that token match only keys whose recorded values exactly match current
+    resolution are removed, so user-owned values that share FCC key names
+    survive. Returns ``False`` without writing when the existing config is
     malformed, or silently when the file does not exist.
     """
 
@@ -236,32 +264,57 @@ def unconfigure_claude_desktop_config(
         )
         return False
 
+    backup_raw = data.get(_BACKUP_KEY)
+    backup: dict[str, object] = {}
+    if isinstance(backup_raw, dict):
+        backup = backup_raw
+
     changed = False
 
     if _DISCOVERY_KEY in data:
         del data[_DISCOVERY_KEY]
         changed = True
 
-    if _INFERENCE_KEY in data:
-        inference = data[_INFERENCE_KEY]
-        if isinstance(inference, dict):
-            inference_dict: dict[str, object] = {}
-            for key, value in inference.items():
+    inference_raw = data.get(_INFERENCE_KEY)
+    inference_dict: dict[str, object] = {}
+    if isinstance(inference_raw, dict):
+        for key, value in inference_raw.items():
+            inference_dict[str(key)] = value
+
+    if backup:
+        for key in managed:
+            if key in inference_dict:
+                del inference_dict[key]
+                changed = True
+        prior_raw = backup.get("inference")
+        if isinstance(prior_raw, dict):
+            for key, value in prior_raw.items():
                 inference_dict[str(key)] = value
-            managed_token = managed["inferenceAnthropicApiKey"]
-            fcc_owned = inference_dict.get("inferenceAnthropicApiKey") == managed_token
-            for key, value in managed.items():
-                recorded = inference_dict.get(key)
-                if recorded is not None and (fcc_owned or recorded == value):
-                    del inference_dict[key]
-                    changed = True
-            if inference_dict:
+                changed = True
+    elif inference_dict:
+        managed_token = managed["inferenceAnthropicApiKey"]
+        fcc_owned = inference_dict.get("inferenceAnthropicApiKey") == managed_token
+        for key, value in managed.items():
+            recorded = inference_dict.get(key)
+            if recorded is not None and (fcc_owned or recorded == value):
+                del inference_dict[key]
+                changed = True
+
+    if _INFERENCE_KEY in data:
+        if inference_dict:
+            if data[_INFERENCE_KEY] != inference_dict:
                 data[_INFERENCE_KEY] = inference_dict
-            else:
-                del data[_INFERENCE_KEY]
+                changed = True
         else:
             del data[_INFERENCE_KEY]
             changed = True
+
+    if backup:
+        if backup.get("hadDiscovery") is True:
+            data[_DISCOVERY_KEY] = True
+            changed = True
+        del data[_BACKUP_KEY]
+        changed = True
 
     if changed:
         _save_config(config_path, data)

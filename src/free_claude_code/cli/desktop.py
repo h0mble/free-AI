@@ -179,9 +179,10 @@ def _merge_verified_gateway(settings: Settings) -> None:
     if gateway_url is None:
         logger.warning(
             "Skipping Claude Desktop config merge: no verified HTTPS front "
-            "is available for the desktop gateway. Start the FCC desktop "
-            "host (which manages the front) or enable the caddy TLS proxy, "
-            "then relaunch.",
+            "is available for the desktop gateway. This short-lived launch "
+            "cannot bring one up without orphaning it, so stop the running "
+            "HTTP-only FCC server first, then start the FCC desktop host "
+            "(which manages the front) or enable the caddy TLS proxy.",
         )
         return
     try:
