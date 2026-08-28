@@ -32,6 +32,7 @@ from free_claude_code.core.anthropic.streaming import (
     parse_complete_tool_input,
     tool_schemas_by_name,
 )
+from free_claude_code.core.anthropic.usage import anthropic_input_usage_fields
 from free_claude_code.core.failures import ExecutionFailure
 from free_claude_code.core.openai_responses import (
     OpenAIResponsesRequest,
@@ -718,9 +719,29 @@ class OpenAIChatProvider(BaseProvider):
         """Return provider-specific per-tool argument aliases for this request."""
         return {}
 
+    def _cached_input_tokens(self, usage_info: object) -> int | None:
+        """Return the provider's cached-input count from final Chat usage."""
+        return nested_usage_int(
+            usage_info,
+            "prompt_tokens_details",
+            "cached_tokens",
+        )
+
+    def _cache_write_input_tokens(self, usage_info: object) -> int | None:
+        """Return the provider's cache-write count from final Chat usage."""
+        return nested_usage_int(
+            usage_info,
+            "prompt_tokens_details",
+            "cache_write_tokens",
+        )
+
     def _anthropic_usage_fields(self, usage_info: Any) -> dict[str, int]:
-        """Return provider-specific Anthropic usage fields for final SSE usage."""
-        return {}
+        """Split standard prompt cache counts for final Anthropic usage."""
+        return anthropic_input_usage_fields(
+            usage_int(usage_info, "prompt_tokens"),
+            cache_read_tokens=self._cached_input_tokens(usage_info),
+            cache_creation_tokens=self._cache_write_input_tokens(usage_info),
+        )
 
     async def _create_stream(
         self,
@@ -1080,13 +1101,10 @@ class _OpenAIChatStreamRunner:
         usage = ChatStreamUsage(
             input_tokens=completion.input_tokens,
             output_tokens=completion.output_tokens,
-            cached_tokens=(
-                nested_usage_int(
-                    assembler.usage_info,
-                    "prompt_tokens_details",
-                    "cached_tokens",
-                )
-                or 0
+            cached_tokens=self._provider._cached_input_tokens(assembler.usage_info)
+            or 0,
+            cache_write_tokens=self._provider._cache_write_input_tokens(
+                assembler.usage_info
             ),
             reasoning_tokens=(
                 nested_usage_int(
