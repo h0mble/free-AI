@@ -98,6 +98,34 @@ def test_lookalike_prefixed_path_does_not_serve_aliases() -> None:
     assert response.status_code == 404
 
 
+def test_prefix_equal_to_bare_v1_does_not_leak_aliases() -> None:
+    """A ``DESKTOP_GATEWAY_PREFIX`` of ``v1`` must not capture the bare catalog.
+
+    The bare ``/v1/models`` path starts with ``/v1/`` — a prefix-sniffing
+    check would treat it as the desktop mount and serve Desktop-only aliases
+    to Claude Code, Codex, Pi and every other client. Alias emission must be
+    gated on the exact mounted path instead.
+    """
+    app = create_test_app(
+        Settings.model_construct(
+            desktop_gateway_prefix="v1",
+            model="deepseek/deepseek-chat",
+            model_fable=None,
+            model_opus=None,
+            model_sonnet=None,
+            model_haiku=None,
+        )
+    )
+
+    client = TestClient(app)
+    bare = [m["id"] for m in client.get("/v1/models").json()["data"]]
+    mounted = [m["id"] for m in client.get("/v1/v1/models").json()["data"]]
+
+    assert all(not i.startswith("claude-sonnet-nim") for i in bare)
+    assert "anthropic/deepseek/deepseek-chat" in bare
+    assert any(i.startswith("claude-sonnet-nim") for i in mounted)
+
+
 def test_messages_round_trip_works_under_desktop_prefix() -> None:
     """Claude Desktop chats against the prefixed base URL, so the full API
     surface must exist under the prefix too."""

@@ -207,10 +207,15 @@ async def list_models(
 
     Served both bare and under the desktop path prefix. Picker aliases are
     emitted only on the prefixed mount so Claude Code, Codex, Pi and every
-    other FCC client keep seeing raw provider refs.
+    other FCC client keep seeing raw provider refs. The mount is identified
+    by exact path equality, not by a prefix sniff: a
+    ``DESKTOP_GATEWAY_PREFIX`` of ``v1`` would otherwise make the bare
+    ``/v1/models`` path satisfy a ``startswith`` check and leak Desktop-only
+    aliases to every client.
     """
     trace_event(stage="ingress", event="free_claude_code.api.models.list", source="api")
-    picker_aliases = request.url.path.startswith(f"/{settings.desktop_gateway_prefix}/")
+    desktop_mount_path = f"/{settings.desktop_gateway_prefix}/v1/models"
+    picker_aliases = request.url.path == desktop_mount_path
     return build_models_list_response(
         settings,
         services.requests,
