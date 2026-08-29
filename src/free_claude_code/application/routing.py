@@ -146,6 +146,18 @@ class ModelRouter:
     def _direct_provider_model(
         self, model_name: str
     ) -> tuple[str | None, str | None, bool]:
+        alias_resolution = resolve_picker_alias(model_name)
+        if alias_resolution is not None:
+            aliased_ref, force_reasoning_off = alias_resolution
+            provider_id, separator, provider_model = aliased_ref.partition("/")
+            if (
+                not separator
+                or provider_id not in SUPPORTED_PROVIDER_IDS
+                or not provider_model
+            ):
+                return None, None, False
+            return provider_id, provider_model, force_reasoning_off
+
         decoded = decode_gateway_model_id(model_name)
         if decoded is not None:
             if decoded.provider_id not in SUPPORTED_PROVIDER_IDS:
